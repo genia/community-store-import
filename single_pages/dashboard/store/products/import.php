@@ -34,7 +34,14 @@ $imageFID = File::getByID(intval($config->get('community_store_import.default_im
             <div class="col-md-6">
                 <label class="control-label"><?php echo t('Default Product Image') ?></label>
                 <?php echo $concrete_asset_library->file('ccm-default-file', 'default_image', t('Choose File'), $imageFID); ?>
-                <div class="help-block"><?php echo t('Choose the default image to use for each imported product.') ?></div>
+                <div class="help-block"><?php echo t('Choose the default image to use for each imported product (if imageFile column is not provided).') ?></div>
+            </div>
+        </div>
+        <div class="form-group">
+            <div class="col-md-6">
+                <label class="control-label"><?php echo t('Product Images Directory') ?></label>
+                <?php echo $form->text('image_directory', $config->get('community_store_import.image_directory'), ['placeholder' => '/path/to/images/directory']); ?>
+                <div class="help-block"><?php echo t('Enter the full filesystem path to the directory containing product images. Images will be matched by filename from the imageFile column in your CSV.') ?></div>
             </div>
         </div>
         <div class="form-group">

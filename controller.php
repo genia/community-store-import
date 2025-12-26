@@ -38,6 +38,7 @@ class Controller extends Package
         $this->setConfigValue('community_store_import.import_file', null);
         $this->setConfigValue('community_store_import.max_execution_time', '60');
         $this->setConfigValue('community_store_import.default_image', null);
+        $this->setConfigValue('community_store_import.image_directory', '');
         $this->setConfigValue('community_store_import.csv.delimiter', ',');
         $this->setConfigValue('community_store_import.csv.enclosure', '"');
         $this->setConfigValue('community_store_import.csv.line_length', 1000);
@@ -85,6 +86,7 @@ class Controller extends Package
             'community_store_import.import_file',
             'community_store_import.max_execution_time',
             'community_store_import.default_image',
+            'community_store_import.image_directory',
             'community_store_import.csv.delimiter',
             'community_store_import.csv.enclosure',
             'community_store_import.csv.line_length',

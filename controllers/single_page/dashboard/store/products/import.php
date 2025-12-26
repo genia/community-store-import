@@ -3,6 +3,8 @@ namespace Concrete\Package\CommunityStoreImport\Controller\SinglePage\Dashboard\
 
 use Concrete\Core\Page\Controller\DashboardPageController;
 use Concrete\Core\File\File;
+use Concrete\Core\File\Importer;
+use Concrete\Core\File\Service\File as FileService;
 use Concrete\Core\Logging\Logger;
 use Concrete\Core\Config\Repository\Repository as Config;
 use Exception;
@@ -84,6 +86,8 @@ class Import extends DashboardPageController
 
         $updated = 0;
         $added = 0;
+        $imagesProcessed = 0;
+        $imagesFailed = 0;
 
         while (($csv = fgetcsv($handle, $line_length, $delim, $enclosure)) !== FALSE) {
             if (count($csv) === 1) {
@@ -95,18 +99,46 @@ class Import extends DashboardPageController
 
             $p = Product::getBySKU($row['psku']);
             
+            $imageProcessed = false;
             if ($p instanceof Product) {
+                $oldImageId = $p->getImageId();
                 $this->update($p, $row);
                 $updated++;
+                // Check if image was updated
+                if (isset($row['imagefile']) && !empty($row['imagefile'])) {
+                    $newImageId = $p->getImageId();
+                    $imageProcessed = ($newImageId && $newImageId != $oldImageId);
+                }
             } else {
                 $p = $this->add($row);
                 $added++;
+                // Check if image was set for new product
+                if (isset($row['imagefile']) && !empty($row['imagefile'])) {
+                    $imageProcessed = (bool)$p->getImageId();
+                }
+            }
+
+            // Count images
+            if (isset($row['imagefile']) && !empty($row['imagefile'])) {
+                if ($imageProcessed) {
+                    $imagesProcessed++;
+                } else {
+                    $imagesFailed++;
+                }
             }
 
             // @TODO: dispatch events - see Products::save()
         }
 
-        $this->set('success', $this->get('success') . "Import completed: $added products added, $updated products updated.");
+        $successMsg = "Import completed: $added products added, $updated products updated.";
+        if ($imagesProcessed > 0 || $imagesFailed > 0) {
+            $successMsg .= " Images processed: $imagesProcessed";
+            if ($imagesFailed > 0) {
+                $successMsg .= ", failed: $imagesFailed";
+            }
+        }
+        
+        $this->set('success', $this->get('success') . $successMsg);
         $logger = $this->app->make(Logger::class);
         $logger->info($this->get('success'));
 
@@ -203,6 +235,14 @@ class Import extends DashboardPageController
             'pTaxClass' => 1        // 1 = default tax class
         );
 
+        // Process image if imageFile column exists (before saving product)
+        if (isset($row['imagefile']) && !empty($row['imagefile'])) {
+            $imageFileId = $this->processProductImage(null, $row['imagefile']);
+            if ($imageFileId) {
+                $data['pfID'] = $imageFileId;
+            }
+        }
+
         // Save product
         $p = Product::saveProduct($data);
 
@@ -253,8 +293,17 @@ class Import extends DashboardPageController
         if ($row['ppackagedata']) $p->setPackageData($row['ppackagedata']);
 
         $config = $this->app->make(Config::class);
-        if (! $p->getImageId())
+        
+        // Process image if imageFile column exists
+        if (isset($row['imagefile']) && !empty($row['imagefile'])) {
+            $imageFileId = $this->processProductImage($p, $row['imagefile']);
+            if ($imageFileId) {
+                $p->setImageId($imageFileId);
+            }
+        } elseif (! $p->getImageId()) {
+            // Only use default if no image was set
             $p->setImageId($config->get('community_store_import.default_image'));
+        }
 
         // Product attributes
         $this->setAttributes($p, $row);
@@ -276,10 +325,86 @@ class Import extends DashboardPageController
 
         $config->save('community_store_import.import_file', $data['import_file']);
         $config->save('community_store_import.default_image', $data['default_image']);
+        $config->save('community_store_import.image_directory', isset($data['image_directory']) ? $data['image_directory'] : '');
         $config->save('community_store_import.max_execution_time', $data['max_execution_time']);
         $config->save('community_store_import.csv.delimiter', $data['delimiter']);
         $config->save('community_store_import.csv.enclosure', $data['enclosure']);
         $config->save('community_store_import.csv.line_length', $data['line_length']);
+    }
+
+    /**
+     * Process and upload product image from filesystem
+     * @param Product|null $product Product object (null if called before product creation)
+     * @param string $imageFilename Filename or full path from CSV imageFile column
+     * @return int|false File ID on success, false on failure
+     */
+    private function processProductImage($product, $imageFilename)
+    {
+        // Check if imageFile contains a full path (has directory separators)
+        $hasPathSeparator = (strpos($imageFilename, '/') !== false || strpos($imageFilename, '\\') !== false);
+        
+        if ($hasPathSeparator) {
+            // Use the full path directly
+            $imagePath = $imageFilename;
+        } else {
+            // Use configured image directory + filename
+            $config = $this->app->make(Config::class);
+            $imageDir = $config->get('community_store_import.image_directory');
+            
+            if (empty($imageDir) || !is_dir($imageDir)) {
+                return false;
+            }
+
+            // Clean filename - remove any path components for security
+            $imageFilename = basename($imageFilename);
+            $imagePath = rtrim($imageDir, '/') . '/' . $imageFilename;
+        }
+
+        if (!file_exists($imagePath) || !is_readable($imagePath)) {
+            return false;
+        }
+
+        // Check if file is a valid image
+        $allowedExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+        $extension = strtolower(pathinfo($imagePath, PATHINFO_EXTENSION));
+        if (!in_array($extension, $allowedExtensions)) {
+            return false;
+        }
+
+        try {
+            // Import file into ConcreteCMS file manager
+            $importer = $this->app->make(Importer::class);
+            $fileService = $this->app->make(FileService::class);
+            
+            // Get just the filename for import (use basename of the path)
+            $importFilename = basename($imagePath);
+            
+            // Copy file to a temporary location with a unique name to avoid conflicts
+            $tempName = uniqid('import_', true) . '.' . $extension;
+            $tempPath = $fileService->getTemporaryDirectory() . '/' . $tempName;
+            
+            if (!copy($imagePath, $tempPath)) {
+                return false;
+            }
+
+            // Import the file
+            $fv = $importer->import($tempPath, $importFilename, null);
+            
+            // Clean up temp file
+            @unlink($tempPath);
+
+            if ($fv instanceof \Concrete\Core\Entity\File\Version) {
+                $file = $fv->getFile();
+                return $file->getFileID();
+            }
+        } catch (Exception $e) {
+            // Log error but don't stop import
+            $logger = $this->app->make(Logger::class);
+            $logger->error('Failed to import image: ' . $imageFilename . ' - ' . $e->getMessage());
+            return false;
+        }
+
+        return false;
     }
 
     private function isValid($headings)
