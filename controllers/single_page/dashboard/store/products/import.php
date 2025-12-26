@@ -5,7 +5,7 @@ use Concrete\Core\Page\Controller\DashboardPageController;
 use Concrete\Core\File\File;
 use Concrete\Core\File\Importer;
 use Concrete\Core\File\Service\File as FileService;
-use Concrete\Core\Logging\Logger;
+use Concrete\Core\Support\Facade\Log;
 use Concrete\Core\Config\Repository\Repository as Config;
 use Exception;
 
@@ -139,8 +139,7 @@ class Import extends DashboardPageController
         }
         
         $this->set('success', $this->get('success') . $successMsg);
-        $logger = $this->app->make(Logger::class);
-        $logger->info($this->get('success'));
+        Log::addInfo($this->get('success'));
 
         ini_set('auto_detect_line_endings', FALSE);
         ini_set('max_execution_time', $MAX_EXECUTION_TIME);
@@ -372,12 +371,18 @@ class Import extends DashboardPageController
         }
 
         try {
+            // Get just the filename for import (use basename of the path)
+            $importFilename = basename($imagePath);
+            
+            // Check if file with same filename already exists
+            $existingFile = $this->findExistingFile($importFilename);
+            if ($existingFile) {
+                return $existingFile->getFileID();
+            }
+            
             // Import file into ConcreteCMS file manager
             $importer = $this->app->make(Importer::class);
             $fileService = $this->app->make(FileService::class);
-            
-            // Get just the filename for import (use basename of the path)
-            $importFilename = basename($imagePath);
             
             // Copy file to a temporary location with a unique name to avoid conflicts
             $tempName = uniqid('import_', true) . '.' . $extension;
@@ -399,11 +404,44 @@ class Import extends DashboardPageController
             }
         } catch (Exception $e) {
             // Log error but don't stop import
-            $logger = $this->app->make(Logger::class);
-            $logger->error('Failed to import image: ' . $imageFilename . ' - ' . $e->getMessage());
+            Log::addWarning('Failed to import image: ' . $imageFilename . ' - ' . $e->getMessage());
             return false;
         }
 
+        return false;
+    }
+
+    /**
+     * Find existing file by filename
+     * @param string $filename
+     * @return File|false File object if found, false otherwise
+     */
+    private function findExistingFile($filename)
+    {
+        try {
+            $db = \Database::connection();
+            
+            // Query for files with matching approved version filename
+            $query = "SELECT f.fID FROM Files f 
+                      INNER JOIN FileVersions fv ON f.fID = fv.fID 
+                      WHERE fv.fvFilename = ? 
+                      AND fv.fvIsApproved = 1 
+                      ORDER BY fv.fvID DESC 
+                      LIMIT 1";
+            
+            $fileID = $db->fetchColumn($query, [$filename]);
+            
+            if ($fileID) {
+                $file = File::getByID($fileID);
+                if ($file && !$file->isError()) {
+                    return $file;
+                }
+            }
+        } catch (Exception $e) {
+            // If there's an error, just continue and upload new file
+            Log::addWarning('Error checking for existing file: ' . $filename . ' - ' . $e->getMessage());
+        }
+        
         return false;
     }
 
