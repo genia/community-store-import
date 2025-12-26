@@ -1,14 +1,11 @@
 <?php
 namespace Concrete\Package\CommunityStoreImport\Controller\SinglePage\Dashboard\Store\Products;
 
-use Concrete\Core\Controller\Controller;
 use Concrete\Core\Page\Controller\DashboardPageController;
-use Concrete\Core\Package\Package as Package;
 use Concrete\Core\File\File;
-use Log;
+use Concrete\Core\Logging\Logger;
+use Concrete\Core\Config\Repository\Repository as Config;
 use Exception;
-use Config;
-use Core;
 
 use Concrete\Package\CommunityStore\Src\CommunityStore\Product\ProductList;
 use Concrete\Package\CommunityStore\Src\CommunityStore\Product\Product;
@@ -34,22 +31,23 @@ class Import extends DashboardPageController
         $this->requireAsset('core/sitemap');
         $this->requireAsset('css', 'select2');
         $this->requireAsset('javascript', 'select2');
-        $this->set('concrete_asset_library', Core::make('helper/concrete/asset_library'));
-        $this->set('form', Core::make('helper/form'));
+        $this->set('concrete_asset_library', $this->app->make('helper/concrete/asset_library'));
+        $this->set('form', $this->app->make('helper/form'));
     }
 
     public function run()
     {
         $this->saveSettings();
 
-        $MAX_TIME = Config::get('community_store_import.max_execution_time');
+        $config = $this->app->make(Config::class);
+        $MAX_TIME = $config->get('community_store_import.max_execution_time');
         $MAX_EXECUTION_TIME = ini_get('max_execution_time');
         $MAX_INPUT_TIME = ini_get('max_input_time');
         ini_set('max_execution_time', $MAX_TIME);
         ini_set('max_input_time', $MAX_TIME);
         ini_set('auto_detect_line_endings', TRUE);
 
-        $f = \File::getByID(Config::get('community_store_import.import_file'));
+        $f = File::getByID($config->get('community_store_import.import_file'));
         $fname = $_SERVER['DOCUMENT_ROOT'] . $f->getApprovedVersion()->getRelativePath();
 
         if (!file_exists($fname) || !is_readable($fname)) {
@@ -62,11 +60,11 @@ class Import extends DashboardPageController
             return;
         }
 
-        $delim = Config::get('community_store_import.csv.delimiter');
+        $delim = $config->get('community_store_import.csv.delimiter');
         $delim = ($delim === '\t') ? "\t" : $delim;
 
-        $enclosure = Config::get('community_store_import.csv.enclosure');
-        $line_length = Config::get('community_store_import.csv.line_length');
+        $enclosure = $config->get('community_store_import.csv.enclosure');
+        $line_length = $config->get('community_store_import.csv.line_length');
 
         // Get headings
         $csv = fgetcsv($handle, $line_length, $delim, $enclosure);
@@ -109,7 +107,8 @@ class Import extends DashboardPageController
         }
 
         $this->set('success', $this->get('success') . "Import completed: $added products added, $updated products updated.");
-        Log::addNotice($this->get('success'));
+        $logger = $this->app->make(Logger::class);
+        $logger->info($this->get('success'));
 
         ini_set('auto_detect_line_endings', FALSE);
         ini_set('max_execution_time', $MAX_EXECUTION_TIME);
@@ -198,7 +197,7 @@ class Import extends DashboardPageController
             'pMaxQty' => (isset($row['pmaxqty']) ? $row['pmaxqty'] : 0),
 
             // Not supported in CSV data
-            'pfID' => Config::get('community_store_import.default_image'),
+            'pfID' => $this->app->make(Config::class)->get('community_store_import.default_image'),
             'pVariations' => false,
             'pQuantityPrice' => false,
             'pTaxClass' => 1        // 1 = default tax class
@@ -253,8 +252,9 @@ class Import extends DashboardPageController
         if ($row['pseparateship']) $p->setSeparateShip($row['pseparateship']);
         if ($row['ppackagedata']) $p->setPackageData($row['ppackagedata']);
 
+        $config = $this->app->make(Config::class);
         if (! $p->getImageId())
-            $p->setImageId(Config::get('community_store_import.default_image'));
+            $p->setImageId($config->get('community_store_import.default_image'));
 
         // Product attributes
         $this->setAttributes($p, $row);
@@ -270,15 +270,16 @@ class Import extends DashboardPageController
     private function saveSettings()
     {
         $data = $this->post();
+        $config = $this->app->make(Config::class);
 
         // @TODO: Validate post data
 
-        Config::save('community_store_import.import_file', $data['import_file']);
-        Config::save('community_store_import.default_image', $data['default_image']);
-        Config::save('community_store_import.max_execution_time', $data['max_execution_time']);
-        Config::save('community_store_import.csv.delimiter', $data['delimiter']);
-        Config::save('community_store_import.csv.enclosure', $data['enclosure']);
-        Config::save('community_store_import.csv.line_length', $data['line_length']);
+        $config->save('community_store_import.import_file', $data['import_file']);
+        $config->save('community_store_import.default_image', $data['default_image']);
+        $config->save('community_store_import.max_execution_time', $data['max_execution_time']);
+        $config->save('community_store_import.csv.delimiter', $data['delimiter']);
+        $config->save('community_store_import.csv.enclosure', $data['enclosure']);
+        $config->save('community_store_import.csv.line_length', $data['line_length']);
     }
 
     private function isValid($headings)
@@ -286,7 +287,8 @@ class Import extends DashboardPageController
         // @TODO: implement
 
         // @TODO: interrogate database for non-null fields
-        $dbname = Config::get('database.connections.concrete.database');
+        $config = $this->app->make(Config::class);
+        $dbname = $config->get('database.connections.concrete.database');
 
         /*
             SELECT GROUP_CONCAT(column_name) nonnull_columns
