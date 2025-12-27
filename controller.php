@@ -11,7 +11,7 @@ class Controller extends Package
 {
     protected $pkgHandle = 'community_store_import';
     protected $appVersionRequired = '9.0.0';
-    protected $pkgVersion = '0.9.5';
+    protected $pkgVersion = '0.9.8';
 
     public function getPackageDescription()
     {
@@ -50,12 +50,19 @@ class Controller extends Package
     {
         $page = Page::getByPath($path);
         if (!is_object($page) || $page->isError()) {
-            SinglePage::add($path, $pkg);
-            // Get the page again after creation
-            $page = Page::getByPath($path);
+            $page = SinglePage::add($path, $pkg);
             if (is_object($page) && !$page->isError()) {
                 $page->update(['cName' => t($name)]);
+                // Ensure page is visible in navigation - explicitly set exclude_nav to 0
+                $page->setAttribute('exclude_nav', 0);
+                $page->refreshCache();
             }
+        } elseif (is_object($page) && !$page->isError()) {
+            // Update name if page already exists
+            $page->update(['cName' => t($name)]);
+            // Ensure navigation is enabled
+            $page->setAttribute('exclude_nav', 0);
+            $page->refreshCache();
         }
     }
 
@@ -70,6 +77,10 @@ class Controller extends Package
     public function upgrade()
     {
         parent::upgrade();
+        
+        // Ensure single page exists after upgrade
+        $pkg = $this->app->make('Concrete\Core\Package\PackageService')->getByHandle($this->pkgHandle);
+        $this->installSinglePage('/dashboard/store/products/import', 'Import', $pkg);
     }
 
     public function uninstall()

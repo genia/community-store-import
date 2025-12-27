@@ -88,6 +88,7 @@ class Import extends DashboardPageController
         $added = 0;
         $imagesProcessed = 0;
         $imagesFailed = 0;
+        $pagesCreated = 0;
 
         while (($csv = fgetcsv($handle, $line_length, $delim, $enclosure)) !== FALSE) {
             if (count($csv) === 1) {
@@ -127,6 +128,11 @@ class Import extends DashboardPageController
                 }
             }
 
+            // Generate product page if it doesn't exist
+            if ($this->generateProductPage($p)) {
+                $pagesCreated++;
+            }
+
             // @TODO: dispatch events - see Products::save()
         }
 
@@ -136,6 +142,9 @@ class Import extends DashboardPageController
             if ($imagesFailed > 0) {
                 $successMsg .= ", failed: $imagesFailed";
             }
+        }
+        if ($pagesCreated > 0) {
+            $successMsg .= " Product pages created: $pagesCreated";
         }
         
         $this->set('success', $this->get('success') . $successMsg);
@@ -409,6 +418,33 @@ class Import extends DashboardPageController
         }
 
         return false;
+    }
+
+    /**
+     * Generate product page if it doesn't exist
+     * @param Product $product
+     * @return bool True if page was created, false otherwise
+     */
+    private function generateProductPage($product)
+    {
+        // Check if product already has a page
+        if ($product->getPageID()) {
+            return false;
+        }
+
+        try {
+            // Use the Product's generatePage method to create the page
+            if ($product->generatePage()) {
+                Log::addInfo('Product page created for product: ' . $product->getName() . ' (SKU: ' . $product->getSKU() . ')');
+                return true;
+            } else {
+                Log::addWarning('Failed to create product page for: ' . $product->getName() . ' (SKU: ' . $product->getSKU() . ') - Product publish target may not be configured');
+                return false;
+            }
+        } catch (Exception $e) {
+            Log::addWarning('Error creating product page for: ' . $product->getName() . ' (SKU: ' . $product->getSKU() . ') - ' . $e->getMessage());
+            return false;
+        }
     }
 
     /**
