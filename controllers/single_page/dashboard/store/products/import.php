@@ -14,6 +14,9 @@ use Concrete\Package\CommunityStore\Src\CommunityStore\Product\Product;
 use Concrete\Package\CommunityStore\Entity\Attribute\Key\StoreProductKey;
 use Concrete\Package\CommunityStore\Src\CommunityStore\Group\Group as StoreGroup;
 use Concrete\Package\CommunityStore\Src\CommunityStore\Product\ProductGroup;
+use Concrete\Package\CommunityStore\Src\CommunityStore\Multilingual\Translation;
+use Concrete\Core\Multilingual\Page\Section\Section;
+use Concrete\Core\Page\Page;
 
 
 class Import extends DashboardPageController
@@ -84,11 +87,26 @@ class Import extends DashboardPageController
             }
         }
 
+        // Detect multilingual columns (e.g., "pname - ru", "pdesc - ru")
+        $multilingualColumns = [];
+        foreach ($headings as $heading) {
+            // Match patterns like "pname - ru", "pdesc - ru", "pdetail - ru"
+            if (preg_match('/^(pname|pdesc|pdetail)\s*-\s*([a-z]{2})$/i', trim($heading), $matches)) {
+                $field = strtolower($matches[1]);
+                $locale = strtolower($matches[2]);
+                if (!isset($multilingualColumns[$locale])) {
+                    $multilingualColumns[$locale] = [];
+                }
+                $multilingualColumns[$locale][$field] = $heading;
+            }
+        }
+
         $updated = 0;
         $added = 0;
         $imagesProcessed = 0;
         $imagesFailed = 0;
         $pagesCreated = 0;
+        $multilingualProcessed = 0;
 
         while (($csv = fgetcsv($handle, $line_length, $delim, $enclosure)) !== FALSE) {
             if (count($csv) === 1) {
@@ -133,6 +151,13 @@ class Import extends DashboardPageController
                 $pagesCreated++;
             }
 
+            // Process multilingual translations
+            if (!empty($multilingualColumns)) {
+                if ($this->processMultilingualTranslations($p, $row, $multilingualColumns)) {
+                    $multilingualProcessed++;
+                }
+            }
+
             // @TODO: dispatch events - see Products::save()
         }
 
@@ -145,6 +170,9 @@ class Import extends DashboardPageController
         }
         if ($pagesCreated > 0) {
             $successMsg .= " Product pages created: $pagesCreated";
+        }
+        if ($multilingualProcessed > 0) {
+            $successMsg .= " Products with multilingual content: $multilingualProcessed";
         }
         
         $this->set('success', $this->get('success') . $successMsg);
@@ -418,6 +446,194 @@ class Import extends DashboardPageController
         }
 
         return false;
+    }
+
+    /**
+     * Process multilingual translations for a product
+     * @param Product $product
+     * @param array $row CSV row data
+     * @param array $multilingualColumns Array of locale => field mappings (e.g., ['ru' => ['pname' => 'pname - ru', 'pdesc' => 'pdesc - ru']])
+     * @return bool True if any translations were processed, false otherwise
+     */
+    private function processMultilingualTranslations($product, $row, $multilingualColumns)
+    {
+        $em = $this->app->make('Doctrine\ORM\EntityManager');
+        $translationsProcessed = false;
+
+        foreach ($multilingualColumns as $locale => $fields) {
+            // Normalize locale (e.g., 'ru' -> 'ru_RU')
+            $normalizedLocale = $this->normalizeLocale($locale);
+            
+            // Get product name translation if column exists
+            if (isset($fields['pname']) && isset($row[$fields['pname']]) && !empty(trim($row[$fields['pname']]))) {
+                $translatedName = trim($row[$fields['pname']]);
+                $this->saveTranslation($em, $product->getID(), 'productName', $normalizedLocale, $translatedName, false);
+                $translationsProcessed = true;
+            }
+
+            // Get product description translation if column exists
+            if (isset($fields['pdesc']) && isset($row[$fields['pdesc']]) && !empty(trim($row[$fields['pdesc']]))) {
+                $translatedDesc = trim($row[$fields['pdesc']]);
+                $this->saveTranslation($em, $product->getID(), 'productDescription', $normalizedLocale, $translatedDesc, true);
+                $translationsProcessed = true;
+            }
+
+            // Get product detail translation if column exists
+            if (isset($fields['pdetail']) && isset($row[$fields['pdetail']]) && !empty(trim($row[$fields['pdetail']]))) {
+                $translatedDetail = trim($row[$fields['pdetail']]);
+                $this->saveTranslation($em, $product->getID(), 'productDetails', $normalizedLocale, $translatedDetail, true);
+                $translationsProcessed = true;
+            }
+
+            // Update multilingual product pages if they exist
+            if ($translationsProcessed) {
+                $this->updateMultilingualProductPage($product, $normalizedLocale);
+            }
+        }
+
+        return $translationsProcessed;
+    }
+
+    /**
+     * Save a translation to the database
+     * @param \Doctrine\ORM\EntityManager $em Entity manager
+     * @param int $productID Product ID
+     * @param string $entityType Translation entity type (e.g., 'productName', 'productDescription')
+     * @param string $locale Locale code (e.g., 'ru_RU')
+     * @param string $text Translated text
+     * @param bool $isLongText Whether this is a long text (uses extendedText) or short text (uses translatedText)
+     */
+    private function saveTranslation($em, $productID, $entityType, $locale, $text, $isLongText = false)
+    {
+        // Check if translation already exists
+        $qb = $em->createQueryBuilder();
+        $query = $qb->select('t')
+            ->from('Concrete\Package\CommunityStore\Src\CommunityStore\Multilingual\Translation', 't')
+            ->where('t.entityType = :type')
+            ->andWhere('t.locale = :locale')
+            ->andWhere('t.pID = :pid')
+            ->setParameter('type', $entityType)
+            ->setParameter('locale', $locale)
+            ->setParameter('pid', $productID)
+            ->setMaxResults(1)
+            ->getQuery();
+
+        $existing = $query->getResult();
+
+        if (!empty($existing)) {
+            $translation = $existing[0];
+        } else {
+            $translation = new Translation();
+            $translation->setProductID($productID);
+            $translation->setEntityType($entityType);
+            $translation->setLocale($locale);
+        }
+
+        if ($isLongText) {
+            $translation->setExtendedText($text);
+        } else {
+            $translation->setTranslatedText($text);
+        }
+
+        $translation->save();
+
+        Log::addInfo("Saved translation for product ID {$productID}, type: {$entityType}, locale: {$locale}");
+    }
+
+    /**
+     * Normalize locale code (e.g., 'ru' -> 'ru_RU', 'en' -> 'en_US')
+     * This is a simple mapping - you may need to adjust based on your locale setup
+     * @param string $locale Short locale code
+     * @return string Normalized locale code
+     */
+    private function normalizeLocale($locale)
+    {
+        // Common locale mappings
+        $localeMap = [
+            'ru' => 'ru_RU',
+            'en' => 'en_US',
+            'fr' => 'fr_FR',
+            'de' => 'de_DE',
+            'es' => 'es_ES',
+            'it' => 'it_IT',
+            'pt' => 'pt_PT',
+            'zh' => 'zh_CN',
+            'ja' => 'ja_JP',
+        ];
+
+        $locale = strtolower($locale);
+        
+        // If already in format like 'ru_RU', return as-is
+        if (strpos($locale, '_') !== false) {
+            return $locale;
+        }
+
+        // Map common 2-letter codes
+        if (isset($localeMap[$locale])) {
+            return $localeMap[$locale];
+        }
+
+        // Default: return as-is if no mapping found
+        return $locale;
+    }
+
+    /**
+     * Update multilingual product page with translated name
+     * @param Product $product
+     * @param string $locale Locale code
+     */
+    private function updateMultilingualProductPage($product, $locale)
+    {
+        try {
+            $productPage = $product->getProductPage();
+            if (!$productPage || $productPage->isError()) {
+                return; // No product page to update
+            }
+
+            $csm = $this->app->make('cs/helper/multilingual');
+            $mlist = Section::getList();
+
+            // Find the section for this locale
+            foreach ($mlist as $section) {
+                if ($section->getLocale() === $locale) {
+                    $relatedID = $section->getTranslatedPageID($productPage);
+                    
+                    if ($relatedID) {
+                        $translatedPage = Page::getByID($relatedID);
+                        
+                        if ($translatedPage && !$translatedPage->isError()) {
+                            // Update page name with translated product name
+                            $productName = $csm->t(null, 'productName', $product->getID(), false, $locale);
+                            if ($productName) {
+                                $translatedPage->update(['cName' => $productName]);
+                            }
+                        }
+                    } else {
+                        // Product page exists but multilingual page doesn't - create it
+                        $parentPage = $productPage->getParent();
+                        if ($parentPage && !$parentPage->isError()) {
+                            $relatedParentID = $section->getTranslatedPageID($parentPage);
+                            if ($relatedParentID) {
+                                $translatedParentPage = Page::getByID($relatedParentID);
+                                if ($translatedParentPage && !$translatedParentPage->isError()) {
+                                    // Duplicate the product page to create multilingual version
+                                    $translatedPage = $productPage->duplicate($translatedParentPage);
+                                    if ($translatedPage && !$translatedPage->isError()) {
+                                        $productName = $csm->t(null, 'productName', $product->getID(), false, $locale);
+                                        if ($productName) {
+                                            $translatedPage->update(['cName' => $productName]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        } catch (Exception $e) {
+            Log::addWarning("Failed to update multilingual product page for product ID {$product->getID()}, locale: {$locale} - " . $e->getMessage());
+        }
     }
 
     /**
