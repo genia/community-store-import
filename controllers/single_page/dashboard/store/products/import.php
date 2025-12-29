@@ -268,7 +268,10 @@ class Import extends DashboardPageController
             'pfID' => $this->app->make(Config::class)->get('community_store_import.default_image'),
             'pVariations' => false,
             'pQuantityPrice' => false,
-            'pTaxClass' => 1        // 1 = default tax class
+            'pTaxClass' => 1,        // 1 = default tax class
+            // Explicitly set to empty string to prevent null being cast to 0
+            'pCostPrice' => '',
+            'pWholesalePrice' => ''
         );
 
         // Process image if imageFile column exists (before saving product)
@@ -339,6 +342,20 @@ class Import extends DashboardPageController
         } elseif (! $p->getImageId()) {
             // Only use default if no image was set
             $p->setImageId($config->get('community_store_import.default_image'));
+        }
+
+        // Explicitly set cost and wholesale prices to empty string if not in CSV
+        // This prevents them from being set to 0 when missing
+        if (!isset($row['pcostprice']) || $row['pcostprice'] === '') {
+            $p->setCostPrice('');
+        } else {
+            $p->setCostPrice($row['pcostprice']);
+        }
+        
+        if (!isset($row['pwholesaleprice']) || $row['pwholesaleprice'] === '') {
+            $p->setWholesalePrice('');
+        } else {
+            $p->setWholesalePrice($row['pwholesaleprice']);
         }
 
         // Product attributes
