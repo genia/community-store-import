@@ -12,17 +12,17 @@ use Exception;
 use Concrete\Package\CommunityStore\Src\CommunityStore\Product\ProductList;
 use Concrete\Package\CommunityStore\Src\CommunityStore\Product\Product;
 use Concrete\Package\CommunityStore\Entity\Attribute\Key\StoreProductKey;
-use Concrete\Package\CommunityStore\Src\CommunityStore\Group\Group as StoreGroup;
-use Concrete\Package\CommunityStore\Src\CommunityStore\Product\ProductGroup;
 use Concrete\Package\CommunityStore\Src\CommunityStore\Multilingual\Translation;
 use Concrete\Core\Multilingual\Page\Section\Section;
 use Concrete\Core\Page\Page;
+use Concrete\Package\CommunityStore\Attribute\ProductKey;
 
 
 class Import extends DashboardPageController
 {
     public $helpers = array('form', 'concrete/asset_library', 'json');
     private $attributes = array();
+    private $productAttributes = array(); // pAttr_ prefixed columns for product attributes
 
     public function view()
     {
@@ -80,10 +80,20 @@ class Import extends DashboardPageController
             return;
         }
 
-        // Get attribute headings
+        // Get attribute headings (attr_ prefix - legacy)
         foreach ($headings as $heading) {
             if (preg_match('/^attr_/', $heading)) {
                 $this->attributes[] = $heading;
+            }
+        }
+
+        // Get product attribute headings (pAttr_ prefix - new format)
+        // e.g., pAttr_Type, pAttr_Metal, pAttr_Stone
+        foreach ($headings as $heading) {
+            if (preg_match('/^pattr_/i', $heading)) {
+                // Extract attribute handle from column name (e.g., pAttr_Metal -> metal)
+                $attrHandle = strtolower(preg_replace('/^pattr_/i', '', $heading));
+                $this->productAttributes[$heading] = $attrHandle;
             }
         }
 
@@ -107,6 +117,7 @@ class Import extends DashboardPageController
         $imagesFailed = 0;
         $pagesCreated = 0;
         $multilingualProcessed = 0;
+        $attributesProcessed = 0;
 
         while (($csv = fgetcsv($handle, $line_length, $delim, $enclosure)) !== FALSE) {
             if (count($csv) === 1) {
@@ -158,6 +169,13 @@ class Import extends DashboardPageController
                 }
             }
 
+            // Process product attributes (pAttr_ columns)
+            if (!empty($this->productAttributes)) {
+                if ($this->processProductAttributes($p, $row)) {
+                    $attributesProcessed++;
+                }
+            }
+
             // @TODO: dispatch events - see Products::save()
         }
 
@@ -173,6 +191,9 @@ class Import extends DashboardPageController
         }
         if ($multilingualProcessed > 0) {
             $successMsg .= " Products with multilingual content: $multilingualProcessed";
+        }
+        if ($attributesProcessed > 0) {
+            $successMsg .= " Products with attributes: $attributesProcessed";
         }
         
         $this->set('success', $this->get('success') . $successMsg);
@@ -203,21 +224,150 @@ class Import extends DashboardPageController
         }
     }
 
-    private function setGroups($product, $row) {
-        if ($row['pproductgroups']) {
-            $pGroupNames = explode(',', $row['pproductgroups']);
-            $pGroups = array();
-            foreach ($pGroupNames as $pGroupName) {
-                $storeGroup = StoreGroup::getByName($pGroupName);
-                if (! $storeGroup instanceof StoreGroup) {
-                    $storeGroup = StoreGroup::add($pGroupName);
+    /**
+     * Process product attributes from pAttr_ prefixed columns
+     * Handles multi-value select attributes with comma-separated values
+     * Values are trimmed and capitalized (e.g., "gold, silver" -> ["Gold", "Silver"])
+     * 
+     * @param Product $product
+     * @param array $row CSV row data
+     * @return bool True if any attributes were processed
+     */
+    private function processProductAttributes($product, $row)
+    {
+        $processed = false;
+        
+        try {
+            // Get product attribute category
+            $productCategory = $this->app->make('Concrete\Package\CommunityStore\Attribute\Category\ProductCategory');
+            
+            foreach ($this->productAttributes as $columnName => $attrHandle) {
+                // Check if column exists in row and has a value
+                if (!isset($row[$columnName]) || trim($row[$columnName]) === '') {
+                    continue;
                 }
-                $pGroups[] = $storeGroup;
+                
+                // Get the attribute key
+                $ak = $productCategory->getAttributeKeyByHandle($attrHandle);
+                if (!$ak) {
+                    Log::addWarning("Product attribute not found: {$attrHandle}");
+                    continue;
+                }
+                
+                // Get the raw value from CSV
+                $rawValue = $row[$columnName];
+                
+                // Parse comma-separated values, trim and capitalize each
+                $values = array_map(function($val) {
+                    $val = trim($val);
+                    // Capitalize first letter of each word
+                    return ucwords(strtolower($val));
+                }, explode(',', $rawValue));
+                
+                // Remove empty values
+                $values = array_filter($values, function($val) {
+                    return $val !== '';
+                });
+                
+                if (empty($values)) {
+                    continue;
+                }
+                
+                // Get attribute type to determine how to set the value
+                $attrType = $ak->getAttributeType()->getAttributeTypeHandle();
+                
+                if ($attrType === 'select') {
+                    // For select attributes, we need to pass the option values
+                    // The attribute controller will handle finding/creating options
+                    $this->setSelectAttributeValue($product, $ak, $values);
+                } else {
+                    // For other attribute types, just set the first value as a string
+                    $product->setAttribute($attrHandle, implode(', ', $values));
+                }
+                
+                $processed = true;
             }
-            $data['pProductGroups'] = $pGroups;
+            
+            // Save the product to persist attribute changes
+            if ($processed) {
+                $product->save();
+            }
+            
+        } catch (Exception $e) {
+            Log::addWarning('Error processing product attributes: ' . $e->getMessage());
+        }
+        
+        return $processed;
+    }
 
-            // Update groups
-            ProductGroup::addGroupsForProduct($data, $product);
+    /**
+     * Set a select attribute value on a product
+     * Handles multi-value select attributes by finding or creating option values
+     * 
+     * @param Product $product
+     * @param mixed $ak Attribute key
+     * @param array $values Array of option values to set
+     */
+    private function setSelectAttributeValue($product, $ak, $values)
+    {
+        try {
+            $em = $this->app->make('Doctrine\ORM\EntityManager');
+            
+            // Get the select attribute settings to find/create options
+            $controller = $ak->getController();
+            $akSettings = $ak->getAttributeKeySettings();
+            
+            if (!$akSettings) {
+                Log::addWarning("No settings found for select attribute: " . $ak->getAttributeKeyHandle());
+                return;
+            }
+            
+            // Get the option list
+            $optionList = $akSettings->getOptionList();
+            if (!$optionList) {
+                Log::addWarning("No option list found for select attribute: " . $ak->getAttributeKeyHandle());
+                return;
+            }
+            
+            $selectedOptions = [];
+            $existingOptions = $optionList->getOptions();
+            
+            foreach ($values as $value) {
+                $foundOption = null;
+                
+                // Look for existing option with matching value (case-insensitive)
+                foreach ($existingOptions as $option) {
+                    if (strcasecmp($option->getSelectAttributeOptionValue(), $value) === 0) {
+                        $foundOption = $option;
+                        break;
+                    }
+                }
+                
+                // If option doesn't exist, create it
+                if (!$foundOption) {
+                    $foundOption = new \Concrete\Core\Entity\Attribute\Value\Value\SelectValueOption();
+                    $foundOption->setSelectAttributeOptionValue($value);
+                    $foundOption->setOptionList($optionList);
+                    $foundOption->setDisplayOrder(count($existingOptions) + count($selectedOptions));
+                    $em->persist($foundOption);
+                    
+                    Log::addInfo("Created new select option '{$value}' for attribute: " . $ak->getAttributeKeyHandle());
+                }
+                
+                $selectedOptions[] = $foundOption;
+            }
+            
+            // Flush to ensure new options are saved
+            $em->flush();
+            
+            // Set the attribute value on the product
+            // For multi-select, we pass an array of option objects
+            if (!empty($selectedOptions)) {
+                $product->setAttribute($ak->getAttributeKeyHandle(), $selectedOptions);
+            }
+            
+        } catch (Exception $e) {
+            Log::addWarning('Error setting select attribute value: ' . $e->getMessage());
         }
     }
 
@@ -285,11 +435,8 @@ class Import extends DashboardPageController
         // Save product
         $p = Product::saveProduct($data);
 
-        // Add product attributes
+        // Add product attributes (legacy attr_ format)
         $this->setAttributes($p, $row);
-        
-        // Add product groups
-        $this->setGroups($p, $row);
 
         return $p;
     }
@@ -358,11 +505,8 @@ class Import extends DashboardPageController
             $p->setWholesalePrice($row['pwholesaleprice']);
         }
 
-        // Product attributes
+        // Product attributes (legacy attr_ format)
         $this->setAttributes($p, $row);
-
-        // Product groups
-        $this->setGroups($p, $row);
 
         $p = $p->save();
 
