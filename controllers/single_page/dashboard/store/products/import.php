@@ -4,9 +4,9 @@ namespace Concrete\Package\CommunityStoreImport\Controller\SinglePage\Dashboard\
 use Concrete\Core\Page\Controller\DashboardPageController;
 use Concrete\Core\File\File;
 use Concrete\Core\File\Importer;
-use Concrete\Core\File\Service\File as FileService;
 use Concrete\Core\Support\Facade\Log;
 use Concrete\Core\Config\Repository\Repository as Config;
+use Symfony\Component\HttpFoundation\JsonResponse;
 use Exception;
 
 use Concrete\Package\CommunityStore\Src\CommunityStore\Product\ProductList;
@@ -28,6 +28,79 @@ class Import extends DashboardPageController
     {
         $this->loadFormAssets();
         $this->set('pageTitle', t('Product Import'));
+    }
+
+    /**
+     * Handle image file uploads via drag-and-drop
+     */
+    public function upload_images()
+    {
+        if (!$this->token->validate('upload_images')) {
+            return new JsonResponse([
+                'success' => false,
+                'error' => t('Invalid security token')
+            ], 400);
+        }
+
+        if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
+            return new JsonResponse([
+                'success' => false,
+                'error' => t('File upload failed')
+            ], 400);
+        }
+
+        $file = $_FILES['file'];
+        
+        // Validate file type
+        $allowedExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
+        $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+        if (!in_array($extension, $allowedExtensions)) {
+            return new JsonResponse([
+                'success' => false,
+                'error' => t('Invalid file type. Only image files are allowed.')
+            ], 400);
+        }
+
+        // Check if file with same filename already exists
+        $filename = basename($file['name']);
+        $existingFile = $this->findExistingFile($filename);
+        if ($existingFile) {
+            return new JsonResponse([
+                'success' => true,
+                'skipped' => true,
+                'fileID' => $existingFile->getFileID(),
+                'filename' => $filename,
+                'message' => t('File already exists and was skipped')
+            ]);
+        }
+
+        // Upload the file
+        try {
+            $importer = $this->app->make(Importer::class);
+            $fv = $importer->import($file['tmp_name'], $filename, null);
+
+            if ($fv instanceof \Concrete\Core\Entity\File\Version) {
+                $fileObj = $fv->getFile();
+                return new JsonResponse([
+                    'success' => true,
+                    'skipped' => false,
+                    'fileID' => $fileObj->getFileID(),
+                    'filename' => $filename,
+                    'message' => t('File uploaded successfully')
+                ]);
+            }
+        } catch (Exception $e) {
+            Log::addWarning('Failed to upload image: ' . $filename . ' - ' . $e->getMessage());
+            return new JsonResponse([
+                'success' => false,
+                'error' => t('Failed to upload file: %s', $e->getMessage())
+            ], 500);
+        }
+
+        return new JsonResponse([
+            'success' => false,
+            'error' => t('File upload failed')
+        ], 500);
     }
 
     public function loadFormAssets()
@@ -415,7 +488,7 @@ class Import extends DashboardPageController
             'pMaxQty' => (isset($row['pmaxqty']) ? $row['pmaxqty'] : 0),
 
             // Not supported in CSV data
-            'pfID' => $this->app->make(Config::class)->get('community_store_import.default_image'),
+            'pfID' => null,
             'pVariations' => false,
             'pQuantityPrice' => false,
             'pTaxClass' => 1,        // 1 = default tax class
@@ -486,9 +559,6 @@ class Import extends DashboardPageController
             if ($imageFileId) {
                 $p->setImageId($imageFileId);
             }
-        } elseif (! $p->getImageId()) {
-            // Only use default if no image was set
-            $p->setImageId($config->get('community_store_import.default_image'));
         }
 
         // Explicitly set cost and wholesale prices to empty string if not in CSV
@@ -521,8 +591,6 @@ class Import extends DashboardPageController
         // @TODO: Validate post data
 
         $config->save('community_store_import.import_file', $data['import_file']);
-        $config->save('community_store_import.default_image', $data['default_image']);
-        $config->save('community_store_import.image_directory', isset($data['image_directory']) ? $data['image_directory'] : '');
         $config->save('community_store_import.max_execution_time', $data['max_execution_time']);
         $config->save('community_store_import.csv.delimiter', $data['delimiter']);
         $config->save('community_store_import.csv.enclosure', $data['enclosure']);
@@ -530,82 +598,25 @@ class Import extends DashboardPageController
     }
 
     /**
-     * Process and upload product image from filesystem
+     * Process product image by filename
+     * Looks up existing file by filename in the file manager
      * @param Product|null $product Product object (null if called before product creation)
-     * @param string $imageFilename Filename or full path from CSV imageFile column
+     * @param string $imageFilename Filename from CSV imageFile column
      * @return int|false File ID on success, false on failure
      */
     private function processProductImage($product, $imageFilename)
     {
-        // Check if imageFile contains a full path (has directory separators)
-        $hasPathSeparator = (strpos($imageFilename, '/') !== false || strpos($imageFilename, '\\') !== false);
+        // Clean filename - remove any path components for security
+        $filename = basename($imageFilename);
         
-        if ($hasPathSeparator) {
-            // Use the full path directly
-            $imagePath = $imageFilename;
-        } else {
-            // Use configured image directory + filename
-            $config = $this->app->make(Config::class);
-            $imageDir = $config->get('community_store_import.image_directory');
-            
-            if (empty($imageDir) || !is_dir($imageDir)) {
-                return false;
-            }
-
-            // Clean filename - remove any path components for security
-            $imageFilename = basename($imageFilename);
-            $imagePath = rtrim($imageDir, '/') . '/' . $imageFilename;
+        // Check if file with same filename already exists
+        $existingFile = $this->findExistingFile($filename);
+        if ($existingFile) {
+            return $existingFile->getFileID();
         }
-
-        if (!file_exists($imagePath) || !is_readable($imagePath)) {
-            return false;
-        }
-
-        // Check if file is a valid image
-        $allowedExtensions = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-        $extension = strtolower(pathinfo($imagePath, PATHINFO_EXTENSION));
-        if (!in_array($extension, $allowedExtensions)) {
-            return false;
-        }
-
-        try {
-            // Get just the filename for import (use basename of the path)
-            $importFilename = basename($imagePath);
-            
-            // Check if file with same filename already exists
-            $existingFile = $this->findExistingFile($importFilename);
-            if ($existingFile) {
-                return $existingFile->getFileID();
-            }
-            
-            // Import file into ConcreteCMS file manager
-            $importer = $this->app->make(Importer::class);
-            $fileService = $this->app->make(FileService::class);
-            
-            // Copy file to a temporary location with a unique name to avoid conflicts
-            $tempName = uniqid('import_', true) . '.' . $extension;
-            $tempPath = $fileService->getTemporaryDirectory() . '/' . $tempName;
-            
-            if (!copy($imagePath, $tempPath)) {
-                return false;
-            }
-
-            // Import the file
-            $fv = $importer->import($tempPath, $importFilename, null);
-            
-            // Clean up temp file
-            @unlink($tempPath);
-
-            if ($fv instanceof \Concrete\Core\Entity\File\Version) {
-                $file = $fv->getFile();
-                return $file->getFileID();
-            }
-        } catch (Exception $e) {
-            // Log error but don't stop import
-            Log::addWarning('Failed to import image: ' . $imageFilename . ' - ' . $e->getMessage());
-            return false;
-        }
-
+        
+        // If file doesn't exist, return false (image should be uploaded via drag-drop first)
+        Log::addInfo('Image file not found in system: ' . $filename . ' - Ensure the file is uploaded via the drag-drop area first.');
         return false;
     }
 
@@ -834,10 +845,11 @@ class Import extends DashboardPageController
         try {
             $db = \Database::connection();
             
-            // Query for files with matching approved version filename
+            // Query for files with matching approved version filename (case-insensitive)
+            // Use LOWER() for case-insensitive comparison as filename matching should be case-insensitive
             $query = "SELECT f.fID FROM Files f 
                       INNER JOIN FileVersions fv ON f.fID = fv.fID 
-                      WHERE fv.fvFilename = ? 
+                      WHERE LOWER(fv.fvFilename) = LOWER(?) 
                       AND fv.fvIsApproved = 1 
                       ORDER BY fv.fvID DESC 
                       LIMIT 1";
