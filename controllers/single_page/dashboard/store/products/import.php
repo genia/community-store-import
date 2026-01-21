@@ -4,6 +4,7 @@ namespace Concrete\Package\CommunityStoreImport\Controller\SinglePage\Dashboard\
 use Concrete\Core\Page\Controller\DashboardPageController;
 use Concrete\Core\File\File;
 use Concrete\Core\File\Importer;
+use Concrete\Core\File\Service\File as FileService;
 use Concrete\Core\Support\Facade\Log;
 use Concrete\Core\Config\Repository\Repository as Config;
 use Symfony\Component\HttpFoundation\JsonResponse;
@@ -128,48 +129,88 @@ class Import extends DashboardPageController
         $data = $this->post();
         $handle = null;
         $isGoogleSheets = false;
+        $googleSheetsImageMap = []; // Map row index => image file path for embedded images
+        $googleSheetsData = null; // Parsed data from Google Sheets HTML
+        $headings = [];
+        $allRows = []; // All data rows to process
 
         // Check if Google Sheets URL is provided
         if (!empty($data['google_sheets_url'])) {
-            $csvContent = $this->fetchGoogleSheetsCsv($data['google_sheets_url']);
-            if ($csvContent === false) {
-                $this->error->add(t("Failed to fetch data from Google Sheets. Please ensure the sheet is publicly viewable."));
+            // Extract spreadsheet ID
+            if (!preg_match('/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/', $data['google_sheets_url'], $matches)) {
+                $this->error->add(t("Invalid Google Sheets URL."));
                 return;
             }
-            // Create a temporary file handle from the CSV content
-            $handle = fopen('php://temp', 'r+');
-            fwrite($handle, $csvContent);
-            rewind($handle);
+            $spreadsheetId = $matches[1];
+            
+            // Download and parse the zip export (HTML + images)
+            Log::addInfo('Parsing Google Sheets zip export for spreadsheet ID: ' . $spreadsheetId);
+            $googleSheetsData = $this->parseGoogleSheetsZip($spreadsheetId);
+            
+            if ($googleSheetsData === false) {
+                // Check the log for specific failure reason
+                $this->error->add(t("Failed to fetch data from Google Sheets. Check the logs for details. Spreadsheet ID: %s", $spreadsheetId));
+                return;
+            }
+            
+            if (empty($googleSheetsData['headings'])) {
+                $this->error->add(t("No data found in Google Sheets. The sheet may be empty or the format is not recognized."));
+                return;
+            }
+            
+            $headings = $googleSheetsData['headings'];
+            $allRows = $googleSheetsData['rows'];
+            $googleSheetsImageMap = $googleSheetsData['images'];
             $isGoogleSheets = true;
+            
+            Log::addInfo('Google Sheets parsed: ' . count($headings) . ' columns, ' . count($allRows) . ' rows, ' . count($googleSheetsImageMap) . ' images');
         } else {
-            // Use uploaded file as before
-            $f = File::getByID($config->get('community_store_import.import_file'));
+            // Use uploaded CSV file
+        $f = File::getByID($config->get('community_store_import.import_file'));
             if (!$f || $f->isError()) {
                 $this->error->add(t("Import file not found. Please upload a CSV file or provide a Google Sheets URL."));
                 return;
             }
-            $fname = $_SERVER['DOCUMENT_ROOT'] . $f->getApprovedVersion()->getRelativePath();
+        $fname = $_SERVER['DOCUMENT_ROOT'] . $f->getApprovedVersion()->getRelativePath();
 
-            if (!file_exists($fname) || !is_readable($fname)) {
-                $this->error->add(t("Import file not found or is not readable."));
-                return;
-            }
+        if (!file_exists($fname) || !is_readable($fname)) {
+            $this->error->add(t("Import file not found or is not readable."));
+            return;
+        }
 
-            if (!$handle = @fopen($fname, 'r')) {
-                $this->error->add(t('Cannot open file %s.', $fname));
-                return;
-            }
+        if (!$handle = @fopen($fname, 'r')) {
+            $this->error->add(t('Cannot open file %s.', $fname));
+            return;
         }
 
         $delim = $config->get('community_store_import.csv.delimiter');
         $delim = ($delim === '\t') ? "\t" : $delim;
+            if (empty($delim)) {
+                $delim = ',';
+            }
 
         $enclosure = $config->get('community_store_import.csv.enclosure');
-        $line_length = $config->get('community_store_import.csv.line_length');
+            if (empty($enclosure)) {
+                $enclosure = '"';
+            }
+            
+            $line_length = (int) $config->get('community_store_import.csv.line_length');
+            if ($line_length <= 0) {
+                $line_length = 0; // 0 means no limit in fgetcsv
+            }
 
-        // Get headings
+            // Get headings from first row
         $csv = fgetcsv($handle, $line_length, $delim, $enclosure);
         $headings = array_map('strtolower', $csv);
+            
+            // Read all data rows
+            while (($csv = fgetcsv($handle, $line_length, $delim, $enclosure)) !== FALSE) {
+                if (count($csv) > 1) {
+                    $allRows[] = $csv;
+                }
+            }
+            fclose($handle);
+        }
 
         if ($this->isValid($headings)) {
             $this->error->add(t("Required data missing."));
@@ -214,41 +255,42 @@ class Import extends DashboardPageController
         $pagesCreated = 0;
         $multilingualProcessed = 0;
         $attributesProcessed = 0;
+        $embeddedImagesFound = count($googleSheetsImageMap);
+        $embeddedImagesProcessed = 0;
 
-        while (($csv = fgetcsv($handle, $line_length, $delim, $enclosure)) !== FALSE) {
-            if (count($csv) === 1) {
-                continue;
-            }
-
-            // Make associative arrray
-            $row = array_combine($headings, $csv);
+        // Process all rows
+        foreach ($allRows as $rowIndex => $csvRow) {
+            // Make associative array
+            $row = array_combine($headings, $csvRow);
 
             $p = Product::getBySKU($row['psku']);
             
             $imageProcessed = false;
+            $oldImageId = null;
             if ($p instanceof Product) {
                 $oldImageId = $p->getImageId();
-                $this->update($p, $row);
+                $this->update($p, $row, $isGoogleSheets, $googleSheetsImageMap, $rowIndex);
                 $updated++;
-                // Check if image was updated
-                if (isset($row['imagefile']) && !empty($row['imagefile'])) {
-                    $newImageId = $p->getImageId();
+                $newImageId = $p->getImageId();
+                // Check if image was updated (either from filename or embedded)
+                if (isset($row['imagefile'])) {
                     $imageProcessed = ($newImageId && $newImageId != $oldImageId);
                 }
             } else {
-                $p = $this->add($row);
+                $p = $this->add($row, $isGoogleSheets, $googleSheetsImageMap, $rowIndex);
                 $added++;
                 // Check if image was set for new product
-                if (isset($row['imagefile']) && !empty($row['imagefile'])) {
+                if (isset($row['imagefile'])) {
                     $imageProcessed = (bool)$p->getImageId();
                 }
             }
 
             // Count images
-            if (isset($row['imagefile']) && !empty($row['imagefile'])) {
+            if (isset($row['imagefile'])) {
                 if ($imageProcessed) {
                     $imagesProcessed++;
-                } else {
+                } elseif (isset($row['imagefile']) && (trim($row['imagefile']) !== '' || ($isGoogleSheets && isset($googleSheetsImageMap[$rowIndex])))) {
+                    // Only count as failed if there was an image attempt
                     $imagesFailed++;
                 }
             }
@@ -281,6 +323,12 @@ class Import extends DashboardPageController
         }
 
         $successMsg = "Import completed: $added products added, $updated products updated.";
+        if ($embeddedImagesFound > 0) {
+            $successMsg .= " Embedded images found: $embeddedImagesFound";
+            if ($embeddedImagesProcessed > 0) {
+                $successMsg .= ", processed: $embeddedImagesProcessed";
+            }
+        }
         if ($imagesProcessed > 0 || $imagesFailed > 0) {
             $successMsg .= " Images processed: $imagesProcessed";
             if ($imagesFailed > 0) {
@@ -297,6 +345,12 @@ class Import extends DashboardPageController
             $successMsg .= " Products with attributes: $attributesProcessed";
         }
         
+        // Clean up Google Sheets extract directory
+        if ($this->googleSheetsExtractDir && is_dir($this->googleSheetsExtractDir)) {
+            $this->recursiveDelete($this->googleSheetsExtractDir);
+            Log::addInfo('Cleaned up temp directory: ' . $this->googleSheetsExtractDir);
+        }
+        
         $this->set('success', $this->get('success') . $successMsg);
         Log::addInfo($this->get('success'));
 
@@ -306,54 +360,333 @@ class Import extends DashboardPageController
     }
 
     /**
-     * Fetch CSV data from a public Google Sheets URL
-     * @param string $url Google Sheets URL
-     * @return string|false CSV content on success, false on failure
+     * Parse Google Sheets zip export to get data rows and embedded images
+     * @param string $spreadsheetId Google Sheets spreadsheet ID
+     * @return array|false Returns ['headings' => [...], 'rows' => [...], 'images' => [...]] or false on failure
      */
-    private function fetchGoogleSheetsCsv($url)
+    private function parseGoogleSheetsZip($spreadsheetId)
     {
-        // Extract spreadsheet ID from URL
-        // URL format: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit?usp=sharing
-        // Or: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/
-        if (!preg_match('/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/', $url, $matches)) {
-            Log::addWarning('Invalid Google Sheets URL format: ' . $url);
+        try {
+            // Download the zip export which includes HTML + images folder
+            // URL format: https://docs.google.com/spreadsheets/d/{ID}/export?format=zip
+            $zipUrl = 'https://docs.google.com/spreadsheets/d/' . $spreadsheetId . '/export?format=zip';
+            
+            Log::addInfo('Downloading Google Sheets zip from: ' . $zipUrl);
+            
+            $context = stream_context_create([
+                'http' => [
+                    'method' => 'GET',
+                    'header' => [
+                        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept: */*'
+                    ],
+                    'timeout' => 60,
+                    'follow_location' => 1,
+                    'max_redirects' => 10
+                ]
+            ]);
+            
+            $zipContent = @file_get_contents($zipUrl, false, $context);
+            
+            if ($zipContent === false) {
+                Log::addWarning('Failed to download Google Sheets zip export from: ' . $zipUrl);
+                return false;
+            }
+            
+            // Check if we got HTML error page instead of zip
+            if (strlen($zipContent) < 1000 && (stripos($zipContent, '<html') !== false || stripos($zipContent, '<!doctype') !== false)) {
+                Log::addWarning('Google Sheets returned HTML error page instead of zip. Content: ' . substr($zipContent, 0, 500));
+                return false;
+            }
+            
+            Log::addInfo('Downloaded zip export, size: ' . strlen($zipContent) . ' bytes');
+            
+            // Save zip to temp file
+            $fileService = $this->app->make(FileService::class);
+            $tempDir = $fileService->getTemporaryDirectory();
+            $zipPath = $tempDir . '/google_sheets_' . uniqid() . '.zip';
+            file_put_contents($zipPath, $zipContent);
+            
+            // Extract zip
+            $extractDir = $tempDir . '/google_sheets_extract_' . uniqid();
+            $zip = new \ZipArchive();
+            if ($zip->open($zipPath) !== true) {
+                Log::addWarning('Failed to open zip file: ' . $zipPath);
+                @unlink($zipPath);
+                return false;
+            }
+            
+            $zip->extractTo($extractDir);
+            $zip->close();
+            @unlink($zipPath);
+            Log::addInfo('Extracted zip to: ' . $extractDir);
+            
+            // Store extract directory for cleanup later
+            $this->googleSheetsExtractDir = $extractDir;
+            
+            // Find the HTML file
+            $htmlFiles = glob($extractDir . '/*.html');
+            if (empty($htmlFiles)) {
+                $htmlFiles = glob($extractDir . '/*/*.html');
+            }
+            
+            if (empty($htmlFiles)) {
+                Log::addWarning('No HTML file found in zip export');
+                return false;
+            }
+            
+            $htmlFile = $htmlFiles[0];
+            $htmlContent = file_get_contents($htmlFile);
+            $htmlDir = dirname($htmlFile);
+            
+            Log::addInfo('Found HTML file: ' . $htmlFile . ' (' . strlen($htmlContent) . ' bytes)');
+            
+            // Check for resources folder with images
+            $resourcesDir = $htmlDir . '/resources';
+            $resourceImages = [];
+            if (is_dir($resourcesDir)) {
+                $imageFiles = glob($resourcesDir . '/*.{jpg,jpeg,png,gif,webp}', GLOB_BRACE);
+                Log::addInfo('Found ' . count($imageFiles) . ' images in resources folder');
+                foreach ($imageFiles as $imgFile) {
+                    Log::addInfo('  - ' . basename($imgFile));
+                    $resourceImages[] = $imgFile;
+                }
+            } else {
+                Log::addInfo('No resources folder found at: ' . $resourcesDir);
+                // Try looking for images directly in extract dir
+                $imageFiles = glob($extractDir . '/*.{jpg,jpeg,png,gif,webp}', GLOB_BRACE);
+                if (!empty($imageFiles)) {
+                    Log::addInfo('Found ' . count($imageFiles) . ' images in extract dir');
+                    $resourceImages = $imageFiles;
+                }
+            }
+            
+            // Parse HTML table
+            $result = [
+                'headings' => [],
+                'rows' => [],
+                'images' => []
+            ];
+            
+            // Use DOMDocument for reliable HTML parsing
+            $dom = new \DOMDocument();
+            @$dom->loadHTML($htmlContent, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+            $xpath = new \DOMXPath($dom);
+            
+            // Find all rows in the table
+            $tableRows = $xpath->query('//table//tr');
+            Log::addInfo('Found ' . $tableRows->length . ' table rows');
+            $isHeader = true;
+            $dataRowIndex = 0;
+            
+            foreach ($tableRows as $tr) {
+                $cells = $xpath->query('.//td | .//th', $tr);
+                $rowData = [];
+                
+                foreach ($cells as $cell) {
+                    // Get text content, stripping tags
+                    $cellText = trim($cell->textContent);
+                    $rowData[] = $cellText;
+                    
+                    // Check for embedded image in this cell (only for data rows)
+                    if (!$isHeader) {
+                        $imgs = $xpath->query('.//img', $cell);
+                        foreach ($imgs as $img) {
+                            $src = $img->getAttribute('src');
+                            if (!empty($src)) {
+                                Log::addInfo("Row $dataRowIndex: Found img tag with src: " . $src);
+                                
+                                // Try multiple patterns for image paths
+                                $imagePath = null;
+                                
+                                // Pattern 1: cellImage_X_Y.ext in resources folder
+                                if (preg_match('/cellImage_\d+_\d+\.(jpg|jpeg|png|gif|webp)/i', $src)) {
+                                    $imagePath = $htmlDir . '/' . $src;
+                                }
+                                // Pattern 2: Direct relative path
+                                elseif (preg_match('/\.(jpg|jpeg|png|gif|webp)$/i', $src)) {
+                                    $imagePath = $htmlDir . '/' . $src;
+                                }
+                                // Pattern 3: resources/image.ext
+                                elseif (preg_match('/^resources\//i', $src)) {
+                                    $imagePath = $htmlDir . '/' . $src;
+                                }
+                                
+                                if ($imagePath) {
+                                    Log::addInfo("Looking for image at: " . $imagePath);
+                                    if (file_exists($imagePath)) {
+                                        $result['images'][$dataRowIndex] = $imagePath;
+                                        Log::addInfo("Row $dataRowIndex has image: " . basename($src));
+                                    } else {
+                                        Log::addWarning("Image file not found: " . $imagePath);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if ($isHeader) {
+                    // Look for the actual header row - it should contain column names like pSKU, pName, etc.
+                    // Skip rows that look like column letters (A, B, C) or row numbers
+                    $nonEmptyValues = array_filter($rowData, function($v) { return trim($v) !== ''; });
+                    
+                    if (!empty($nonEmptyValues)) {
+                        // Check if this looks like a header row (contains psku, pname, etc.)
+                        $lowerValues = array_map('strtolower', $rowData);
+                        $hasProductColumns = in_array('psku', $lowerValues) || in_array('pname', $lowerValues);
+                        
+                        // Check if this is just column letters (A, B, C, D...)
+                        $isColumnLetters = true;
+                        foreach ($nonEmptyValues as $val) {
+                            $val = trim($val);
+                            // Column letters are single uppercase letters, or row numbers
+                            if (!preg_match('/^[A-Z]{1,2}$/', $val) && !preg_match('/^\d+$/', $val)) {
+                                $isColumnLetters = false;
+                                break;
+                            }
+                        }
+                        
+                        if ($hasProductColumns && !$isColumnLetters) {
+                            $result['headings'] = array_map('strtolower', $rowData);
+                            $isHeader = false;
+                            Log::addInfo('Found header row with columns: ' . implode(', ', array_slice($result['headings'], 0, 10)));
+                        } else {
+                            Log::addInfo('Skipping non-header row: ' . implode(', ', array_slice($rowData, 0, 5)));
+                        }
+                    }
+                } else {
+                    // Skip empty rows
+                    if (!empty(array_filter($rowData))) {
+                        $result['rows'][] = $rowData;
+                        $dataRowIndex++;
+                    }
+                }
+            }
+            
+            // Fallback: If no images were matched via HTML parsing but we have images in resources,
+            // try to match them by filename pattern (cellImage_ROW_COL.ext)
+            if (empty($result['images']) && !empty($resourceImages)) {
+                Log::addInfo('Attempting fallback image matching by filename pattern');
+                foreach ($resourceImages as $imgPath) {
+                    $filename = basename($imgPath);
+                    // Pattern: cellImage_ROW_COL.ext (ROW is 0-based data row index)
+                    if (preg_match('/cellImage_(\d+)_(\d+)\./i', $filename, $matches)) {
+                        $rowIdx = (int)$matches[1];
+                        if ($rowIdx < count($result['rows']) && !isset($result['images'][$rowIdx])) {
+                            $result['images'][$rowIdx] = $imgPath;
+                            Log::addInfo("Matched image by pattern: $filename -> row $rowIdx");
+                        }
+                    }
+                }
+            }
+            
+            Log::addInfo('Parsed ' . count($result['rows']) . ' data rows, ' . count($result['images']) . ' embedded images');
+            return $result;
+            
+        } catch (Exception $e) {
+            Log::addWarning('Error parsing Google Sheets: ' . $e->getMessage());
             return false;
         }
+    }
+    
+    /** @var string|null Temporary directory for Google Sheets extract */
+    private $googleSheetsExtractDir = null;
 
-        $spreadsheetId = $matches[1];
-        
-        // Convert to CSV export URL
-        // Default sheet (gid=0) or you can specify a specific sheet
-        $csvUrl = 'https://docs.google.com/spreadsheets/d/' . $spreadsheetId . '/export?format=csv';
-        
-        // Try to fetch the CSV
-        $context = stream_context_create([
-            'http' => [
-                'method' => 'GET',
-                'header' => [
-                    'User-Agent: Mozilla/5.0 (compatible; ConcreteCMS Import)',
-                    'Accept: text/csv'
-                ],
-                'timeout' => 30,
-                'follow_location' => 1,
-                'max_redirects' => 5
-            ]
-        ]);
-
-        $csvContent = @file_get_contents($csvUrl, false, $context);
-        
-        if ($csvContent === false) {
-            Log::addWarning('Failed to fetch Google Sheets CSV from: ' . $csvUrl);
+    /**
+     * Process an embedded image from Google Sheets
+     * Handles both local file paths (from zip extract) and URLs
+     * @param string $imagePathOrUrl Local file path or URL to the embedded image
+     * @return int|false File ID on success, false on failure
+     */
+    private function processGoogleSheetsEmbeddedImage($imagePathOrUrl)
+    {
+        if (empty($imagePathOrUrl)) {
             return false;
         }
-
-        // Check if we got an error page (Google Sheets sometimes returns HTML error pages)
-        if (stripos($csvContent, '<html') !== false || stripos($csvContent, '<!doctype') !== false) {
-            Log::addWarning('Google Sheets returned HTML instead of CSV. Sheet may not be publicly accessible.');
-            return false;
+        
+        try {
+            $imageData = null;
+            $originalFilename = null;
+            
+            // Check if it's a local file path or URL
+            if (file_exists($imagePathOrUrl)) {
+                // Local file from zip extract
+                $imageData = file_get_contents($imagePathOrUrl);
+                $originalFilename = basename($imagePathOrUrl);
+                Log::addInfo('Reading local image file: ' . $imagePathOrUrl);
+            } else {
+                // URL - download the image
+                $context = stream_context_create([
+                    'http' => [
+                        'method' => 'GET',
+                        'header' => [
+                            'User-Agent: Mozilla/5.0 (compatible; ConcreteCMS Import)',
+                            'Accept: image/*'
+                        ],
+                        'timeout' => 30,
+                        'follow_location' => 1,
+                        'max_redirects' => 5
+                    ]
+                ]);
+                
+                $imageData = @file_get_contents($imagePathOrUrl, false, $context);
+                $originalFilename = basename(parse_url($imagePathOrUrl, PHP_URL_PATH));
+            }
+            
+            if ($imageData === false || empty($imageData)) {
+                Log::addWarning('Failed to read image: ' . $imagePathOrUrl);
+                return false;
+            }
+            
+            // Determine file extension from filename or content
+            $extension = 'jpg'; // default
+            if ($originalFilename && preg_match('/\.(jpg|jpeg|png|gif|webp)/i', $originalFilename, $matches)) {
+                $extension = strtolower($matches[1]);
+                if ($extension === 'jpeg') {
+                    $extension = 'jpg';
+                }
+            } elseif (function_exists('getimagesizefromstring')) {
+                $imageInfo = @getimagesizefromstring($imageData);
+                if ($imageInfo) {
+                    $mimeToExt = [
+                        'image/jpeg' => 'jpg',
+                        'image/png' => 'png',
+                        'image/gif' => 'gif',
+                        'image/webp' => 'webp'
+                    ];
+                    if (isset($mimeToExt[$imageInfo['mime']])) {
+                        $extension = $mimeToExt[$imageInfo['mime']];
+                    }
+                }
+            }
+            
+            // Generate a unique filename
+            $filename = 'product_' . uniqid() . '.' . $extension;
+            
+            // Save to temporary file
+            $fileService = $this->app->make(FileService::class);
+            $tempPath = $fileService->getTemporaryDirectory() . '/' . $filename;
+            file_put_contents($tempPath, $imageData);
+            
+            Log::addInfo('Saved temp image: ' . $tempPath . ' (' . strlen($imageData) . ' bytes)');
+            
+            // Import into ConcreteCMS
+            $importer = $this->app->make(Importer::class);
+            $fv = $importer->import($tempPath, $filename, null);
+            
+            // Clean up temp file
+            @unlink($tempPath);
+            
+            if ($fv instanceof \Concrete\Core\Entity\File\Version) {
+                $file = $fv->getFile();
+                return $file->getFileID();
+            }
+        } catch (Exception $e) {
+            Log::addWarning('Failed to process Google Sheets embedded image: ' . $e->getMessage());
         }
-
-        return $csvContent;
+        
+        return false;
     }
 
     private function setAttributes($product, $row)
@@ -523,7 +856,7 @@ class Import extends DashboardPageController
         }
     }
 
-    private function add($row)
+    private function add($row, $isGoogleSheets = false, $googleSheetsImageMap = [], $rowIndex = 0)
     {
         $data = array(
             'pSKU' => $row['psku'],
@@ -576,13 +909,32 @@ class Import extends DashboardPageController
             'pWholesalePrice' => ''
         );
 
-        // Process image if imageFile column exists (before saving product)
-        if (isset($row['imagefile']) && !empty($row['imagefile'])) {
-            $imageFileId = $this->processProductImage(null, $row['imagefile']);
-            if ($imageFileId) {
-                $data['pfID'] = $imageFileId;
+            // Process image if imageFile column exists (before saving product)
+            if (isset($row['imagefile'])) {
+                $imageFileId = null;
+                
+                // For Google Sheets, check for embedded images first
+                if ($isGoogleSheets && isset($googleSheetsImageMap[$rowIndex])) {
+                    Log::addInfo('Processing embedded image for row ' . $rowIndex . ': ' . (is_string($googleSheetsImageMap[$rowIndex]) ? substr($googleSheetsImageMap[$rowIndex], 0, 100) : 'data'));
+                    // Use embedded image from Google Sheets
+                    $imageFileId = $this->processGoogleSheetsEmbeddedImage($googleSheetsImageMap[$rowIndex]);
+                    if ($imageFileId) {
+                        $data['pfID'] = $imageFileId;
+                        $embeddedImagesProcessed++;
+                        Log::addInfo('Successfully uploaded embedded image, file ID: ' . $imageFileId);
+                    } else {
+                        Log::addWarning('Failed to upload embedded image for row ' . $rowIndex);
+                    }
+                }
+                
+                // If no embedded image was used, try filename from CSV
+                if (!$imageFileId && !empty(trim($row['imagefile']))) {
+                    $imageFileId = $this->processProductImage(null, $row['imagefile']);
+                    if ($imageFileId) {
+                        $data['pfID'] = $imageFileId;
+                    }
+                }
             }
-        }
 
         // Save product
         $p = Product::saveProduct($data);
@@ -593,7 +945,7 @@ class Import extends DashboardPageController
         return $p;
     }
 
-    private function update($p, $row)
+    private function update($p, $row, $isGoogleSheets = false, $googleSheetsImageMap = [], $rowIndex = 0)
     {
         if ($row['psku']) $p->setSKU($row['psku']);
         if ($row['pname']) $p->setName($row['pname']);
@@ -633,10 +985,39 @@ class Import extends DashboardPageController
         $config = $this->app->make(Config::class);
         
         // Process image if imageFile column exists
-        if (isset($row['imagefile']) && !empty($row['imagefile'])) {
-            $imageFileId = $this->processProductImage($p, $row['imagefile']);
-            if ($imageFileId) {
-                $p->setImageId($imageFileId);
+        if (isset($row['imagefile'])) {
+            $imageFileId = null;
+            
+            if ($isGoogleSheets) {
+                // Check for embedded Google Sheets image first
+                if (isset($googleSheetsImageMap[$rowIndex])) {
+                    Log::addInfo('Processing embedded image for row ' . $rowIndex . ' in update(): ' . (is_string($googleSheetsImageMap[$rowIndex]) ? substr($googleSheetsImageMap[$rowIndex], 0, 100) : 'data'));
+                    // Use embedded image from Google Sheets
+                    $imageFileId = $this->processGoogleSheetsEmbeddedImage($googleSheetsImageMap[$rowIndex]);
+                    if ($imageFileId) {
+                        $p->setImageId($imageFileId);
+                        $embeddedImagesProcessed++;
+                        Log::addInfo('Successfully updated product with embedded image, file ID: ' . $imageFileId);
+                    } else {
+                        Log::addWarning('Failed to upload embedded image for row ' . $rowIndex . ' in update()');
+                    }
+                }
+                
+                // If no embedded image was used, try filename from CSV
+                if (!$imageFileId && !empty(trim($row['imagefile']))) {
+                    $imageFileId = $this->processProductImage($p, $row['imagefile']);
+                    if ($imageFileId) {
+                        $p->setImageId($imageFileId);
+                    }
+                }
+            } else {
+                // Regular CSV file - use filename
+                if (!empty(trim($row['imagefile']))) {
+                    $imageFileId = $this->processProductImage($p, $row['imagefile']);
+                    if ($imageFileId) {
+                        $p->setImageId($imageFileId);
+                    }
+                }
             }
         }
 
@@ -968,6 +1349,28 @@ class Import extends DashboardPageController
         */
 
         return (false);
+    }
+
+    /**
+     * Recursively delete a directory and its contents
+     * @param string $dir Directory path to delete
+     */
+    private function recursiveDelete($dir)
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        
+        $files = array_diff(scandir($dir), ['.', '..']);
+        foreach ($files as $file) {
+            $path = $dir . '/' . $file;
+            if (is_dir($path)) {
+                $this->recursiveDelete($path);
+            } else {
+                @unlink($path);
+            }
+        }
+        @rmdir($dir);
     }
 }
 
