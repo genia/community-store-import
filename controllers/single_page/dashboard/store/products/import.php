@@ -125,17 +125,40 @@ class Import extends DashboardPageController
         ini_set('max_input_time', $MAX_TIME);
         ini_set('auto_detect_line_endings', TRUE);
 
-        $f = File::getByID($config->get('community_store_import.import_file'));
-        $fname = $_SERVER['DOCUMENT_ROOT'] . $f->getApprovedVersion()->getRelativePath();
+        $data = $this->post();
+        $handle = null;
+        $isGoogleSheets = false;
 
-        if (!file_exists($fname) || !is_readable($fname)) {
-            $this->error->add(t("Import file not found or is not readable."));
-            return;
-        }
+        // Check if Google Sheets URL is provided
+        if (!empty($data['google_sheets_url'])) {
+            $csvContent = $this->fetchGoogleSheetsCsv($data['google_sheets_url']);
+            if ($csvContent === false) {
+                $this->error->add(t("Failed to fetch data from Google Sheets. Please ensure the sheet is publicly viewable."));
+                return;
+            }
+            // Create a temporary file handle from the CSV content
+            $handle = fopen('php://temp', 'r+');
+            fwrite($handle, $csvContent);
+            rewind($handle);
+            $isGoogleSheets = true;
+        } else {
+            // Use uploaded file as before
+            $f = File::getByID($config->get('community_store_import.import_file'));
+            if (!$f || $f->isError()) {
+                $this->error->add(t("Import file not found. Please upload a CSV file or provide a Google Sheets URL."));
+                return;
+            }
+            $fname = $_SERVER['DOCUMENT_ROOT'] . $f->getApprovedVersion()->getRelativePath();
 
-        if (!$handle = @fopen($fname, 'r')) {
-            $this->error->add(t('Cannot open file %s.', $fname));
-            return;
+            if (!file_exists($fname) || !is_readable($fname)) {
+                $this->error->add(t("Import file not found or is not readable."));
+                return;
+            }
+
+            if (!$handle = @fopen($fname, 'r')) {
+                $this->error->add(t('Cannot open file %s.', $fname));
+                return;
+            }
         }
 
         $delim = $config->get('community_store_import.csv.delimiter');
@@ -252,6 +275,11 @@ class Import extends DashboardPageController
             // @TODO: dispatch events - see Products::save()
         }
 
+        // Close file handle
+        if ($handle) {
+            @fclose($handle);
+        }
+
         $successMsg = "Import completed: $added products added, $updated products updated.";
         if ($imagesProcessed > 0 || $imagesFailed > 0) {
             $successMsg .= " Images processed: $imagesProcessed";
@@ -275,6 +303,57 @@ class Import extends DashboardPageController
         ini_set('auto_detect_line_endings', FALSE);
         ini_set('max_execution_time', $MAX_EXECUTION_TIME);
         ini_set('max_input_time', $MAX_INPUT_TIME);
+    }
+
+    /**
+     * Fetch CSV data from a public Google Sheets URL
+     * @param string $url Google Sheets URL
+     * @return string|false CSV content on success, false on failure
+     */
+    private function fetchGoogleSheetsCsv($url)
+    {
+        // Extract spreadsheet ID from URL
+        // URL format: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit?usp=sharing
+        // Or: https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/
+        if (!preg_match('/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/', $url, $matches)) {
+            Log::addWarning('Invalid Google Sheets URL format: ' . $url);
+            return false;
+        }
+
+        $spreadsheetId = $matches[1];
+        
+        // Convert to CSV export URL
+        // Default sheet (gid=0) or you can specify a specific sheet
+        $csvUrl = 'https://docs.google.com/spreadsheets/d/' . $spreadsheetId . '/export?format=csv';
+        
+        // Try to fetch the CSV
+        $context = stream_context_create([
+            'http' => [
+                'method' => 'GET',
+                'header' => [
+                    'User-Agent: Mozilla/5.0 (compatible; ConcreteCMS Import)',
+                    'Accept: text/csv'
+                ],
+                'timeout' => 30,
+                'follow_location' => 1,
+                'max_redirects' => 5
+            ]
+        ]);
+
+        $csvContent = @file_get_contents($csvUrl, false, $context);
+        
+        if ($csvContent === false) {
+            Log::addWarning('Failed to fetch Google Sheets CSV from: ' . $csvUrl);
+            return false;
+        }
+
+        // Check if we got an error page (Google Sheets sometimes returns HTML error pages)
+        if (stripos($csvContent, '<html') !== false || stripos($csvContent, '<!doctype') !== false) {
+            Log::addWarning('Google Sheets returned HTML instead of CSV. Sheet may not be publicly accessible.');
+            return false;
+        }
+
+        return $csvContent;
     }
 
     private function setAttributes($product, $row)

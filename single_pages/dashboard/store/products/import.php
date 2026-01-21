@@ -26,7 +26,17 @@ $importFID = File::getByID(intval($config->get('community_store_import.import_fi
             <div class="col-md-6">
                 <label class="control-label"><?php echo t('Product Import File') ?></label>
                 <?php echo $concrete_asset_library->file('ccm-import-file', 'import_file', 'Choose File', $importFID) ?>
-                <div class="help-block"><?php echo t('Choose the CSV file to import.') ?></div>
+                <div class="help-block"><?php echo t('Choose the CSV file to import, OR use Google Sheets URL below.') ?></div>
+            </div>
+        </div>
+        <div class="form-group">
+            <div class="col-md-6">
+                <label class="control-label"><?php echo t('Or Import from Google Sheets') ?></label>
+                <?php echo $form->text('google_sheets_url', '', ['placeholder' => 'https://docs.google.com/spreadsheets/d/...', 'class' => 'form-control']); ?>
+                <div class="help-block">
+                    <?php echo t('Enter a public Google Sheets URL to import directly.') ?><br>
+                    <small><?php echo t('The sheet must be publicly viewable: Right-click the sheet → Share → Change to "Anyone with the link" → Viewer') ?></small>
+                </div>
             </div>
         </div>
         <div class="form-group">
