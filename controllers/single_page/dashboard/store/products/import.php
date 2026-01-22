@@ -116,6 +116,11 @@ class Import extends DashboardPageController
 
     public function run()
     {
+        // Ensure error logging is enabled (fallback if .htaccess doesn't work)
+        ini_set('log_errors', '1');
+        ini_set('error_log', '/tmp/php_errors.log');
+        ini_set('error_reporting', E_ALL);
+        
         $this->saveSettings();
 
         $config = $this->app->make(Config::class);
@@ -124,7 +129,7 @@ class Import extends DashboardPageController
         $MAX_INPUT_TIME = ini_get('max_input_time');
         ini_set('max_execution_time', $MAX_TIME);
         ini_set('max_input_time', $MAX_TIME);
-        ini_set('auto_detect_line_endings', TRUE);
+        @ini_set('auto_detect_line_endings', TRUE); // Suppress deprecation warning in PHP 8.1+
 
         $data = $this->post();
         $handle = null;
@@ -372,7 +377,7 @@ class Import extends DashboardPageController
         $this->set('success', $this->get('success') . $successMsg);
         Log::addInfo($this->get('success'));
 
-        ini_set('auto_detect_line_endings', FALSE);
+        @ini_set('auto_detect_line_endings', FALSE); // Suppress deprecation warning in PHP 8.1+
         ini_set('max_execution_time', $MAX_EXECUTION_TIME);
         ini_set('max_input_time', $MAX_INPUT_TIME);
     }
@@ -1101,12 +1106,6 @@ class Import extends DashboardPageController
     {
         $imageFilename = trim($imageFilename);
         
-        // Check if this is a Facebook photo URL
-        if (preg_match('/facebook\.com\/photo/', $imageFilename)) {
-            Log::addInfo('Detected Facebook photo URL: ' . $imageFilename);
-            return $this->processFacebookPhotoUrl($imageFilename);
-        }
-        
         // Check if this is a direct image URL
         if (preg_match('/^https?:\/\//i', $imageFilename)) {
             Log::addInfo('Detected image URL: ' . $imageFilename);
@@ -1125,71 +1124,6 @@ class Import extends DashboardPageController
         // If file doesn't exist, return false (image should be uploaded via drag-drop first)
         Log::addInfo('Image file not found in system: ' . $filename . ' - Ensure the file is uploaded via the drag-drop area first.');
         return false;
-    }
-    
-    /**
-     * Extract and import the main image from a Facebook photo URL
-     * @param string $facebookUrl The Facebook photo page URL
-     * @return int|false File ID on success, false on failure
-     */
-    private function processFacebookPhotoUrl($facebookUrl)
-    {
-        try {
-            // Fetch the Facebook page to extract the og:image meta tag
-            $context = stream_context_create([
-                'http' => [
-                    'method' => 'GET',
-                    'header' => [
-                        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                        'Accept-Language: en-US,en;q=0.5'
-                    ],
-                    'timeout' => 30,
-                    'follow_location' => 1,
-                    'max_redirects' => 5
-                ]
-            ]);
-            
-            $html = @file_get_contents($facebookUrl, false, $context);
-            
-            if ($html === false) {
-                Log::addWarning('Failed to fetch Facebook page: ' . $facebookUrl);
-                return false;
-            }
-            
-            Log::addInfo('Fetched Facebook page, size: ' . strlen($html) . ' bytes');
-            
-            // Extract og:image meta tag
-            $imageUrl = null;
-            
-            // Try og:image first
-            if (preg_match('/<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']/', $html, $matches)) {
-                $imageUrl = $matches[1];
-            } elseif (preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']/', $html, $matches)) {
-                $imageUrl = $matches[1];
-            }
-            
-            // Also try to find high-res image URLs directly (fbcdn URLs)
-            if (!$imageUrl && preg_match('/https:\/\/scontent[^"\'<>\s]+\.jpg[^"\'<>\s]*/i', $html, $matches)) {
-                $imageUrl = html_entity_decode($matches[0]);
-            }
-            
-            if (!$imageUrl) {
-                Log::addWarning('Could not extract image URL from Facebook page: ' . $facebookUrl);
-                return false;
-            }
-            
-            // Decode HTML entities in the URL
-            $imageUrl = html_entity_decode($imageUrl);
-            Log::addInfo('Extracted Facebook image URL: ' . substr($imageUrl, 0, 150) . '...');
-            
-            // Download and import the image
-            return $this->processImageUrl($imageUrl);
-            
-        } catch (\Exception $e) {
-            Log::addWarning('Error processing Facebook photo URL: ' . $e->getMessage());
-            return false;
-        }
     }
     
     /**
