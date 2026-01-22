@@ -933,7 +933,7 @@ class Import extends DashboardPageController
             'pMaxQty' => (isset($row['pmaxqty']) ? $row['pmaxqty'] : 0),
 
             // Not supported in CSV data
-            'pfID' => null,
+            'pfID' => 0,  // Default to 0 (no image) - prod database requires NOT NULL
             'pVariations' => false,
             'pQuantityPrice' => false,
             'pTaxClass' => 1,        // 1 = default tax class
