@@ -260,8 +260,26 @@ class Import extends DashboardPageController
 
         // Process all rows
         foreach ($allRows as $rowIndex => $csvRow) {
+            // Ensure row has same number of columns as headings
+            if (count($csvRow) !== count($headings)) {
+                // Pad or trim to match
+                while (count($csvRow) < count($headings)) {
+                    $csvRow[] = '';
+                }
+                $csvRow = array_slice($csvRow, 0, count($headings));
+            }
+            
             // Make associative array
             $row = array_combine($headings, $csvRow);
+            
+            // Skip rows without required data (must have at least SKU or name)
+            $hasSku = isset($row['psku']) && trim($row['psku']) !== '';
+            $hasName = isset($row['pname']) && trim($row['pname']) !== '';
+            
+            if (!$hasSku && !$hasName) {
+                Log::addInfo("Skipping row $rowIndex: no SKU or name");
+                continue;
+            }
 
             $p = Product::getBySKU($row['psku']);
             
@@ -556,10 +574,25 @@ class Import extends DashboardPageController
                         }
                     }
                 } else {
-                    // Skip empty rows
-                    if (!empty(array_filter($rowData))) {
+                    // Skip empty rows and rows that only contain row numbers
+                    $nonEmptyValues = array_filter($rowData, function($v) { return trim($v) !== ''; });
+                    
+                    // Check if this row has actual data (not just a row number in first column)
+                    $hasRealData = false;
+                    foreach ($nonEmptyValues as $idx => $val) {
+                        $val = trim($val);
+                        // If any cell (except potentially the first) has non-numeric content, it's real data
+                        if ($idx > 0 || !preg_match('/^\d+$/', $val)) {
+                            $hasRealData = true;
+                            break;
+                        }
+                    }
+                    
+                    if ($hasRealData && count($nonEmptyValues) > 1) {
                         $result['rows'][] = $rowData;
                         $dataRowIndex++;
+                    } else if (!empty($nonEmptyValues)) {
+                        Log::addInfo('Skipping row with insufficient data: ' . implode(', ', array_slice($rowData, 0, 5)));
                     }
                 }
             }
@@ -1066,6 +1099,20 @@ class Import extends DashboardPageController
      */
     private function processProductImage($product, $imageFilename)
     {
+        $imageFilename = trim($imageFilename);
+        
+        // Check if this is a Facebook photo URL
+        if (preg_match('/facebook\.com\/photo/', $imageFilename)) {
+            Log::addInfo('Detected Facebook photo URL: ' . $imageFilename);
+            return $this->processFacebookPhotoUrl($imageFilename);
+        }
+        
+        // Check if this is a direct image URL
+        if (preg_match('/^https?:\/\//i', $imageFilename)) {
+            Log::addInfo('Detected image URL: ' . $imageFilename);
+            return $this->processImageUrl($imageFilename);
+        }
+        
         // Clean filename - remove any path components for security
         $filename = basename($imageFilename);
         
@@ -1078,6 +1125,152 @@ class Import extends DashboardPageController
         // If file doesn't exist, return false (image should be uploaded via drag-drop first)
         Log::addInfo('Image file not found in system: ' . $filename . ' - Ensure the file is uploaded via the drag-drop area first.');
         return false;
+    }
+    
+    /**
+     * Extract and import the main image from a Facebook photo URL
+     * @param string $facebookUrl The Facebook photo page URL
+     * @return int|false File ID on success, false on failure
+     */
+    private function processFacebookPhotoUrl($facebookUrl)
+    {
+        try {
+            // Fetch the Facebook page to extract the og:image meta tag
+            $context = stream_context_create([
+                'http' => [
+                    'method' => 'GET',
+                    'header' => [
+                        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language: en-US,en;q=0.5'
+                    ],
+                    'timeout' => 30,
+                    'follow_location' => 1,
+                    'max_redirects' => 5
+                ]
+            ]);
+            
+            $html = @file_get_contents($facebookUrl, false, $context);
+            
+            if ($html === false) {
+                Log::addWarning('Failed to fetch Facebook page: ' . $facebookUrl);
+                return false;
+            }
+            
+            Log::addInfo('Fetched Facebook page, size: ' . strlen($html) . ' bytes');
+            
+            // Extract og:image meta tag
+            $imageUrl = null;
+            
+            // Try og:image first
+            if (preg_match('/<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']/', $html, $matches)) {
+                $imageUrl = $matches[1];
+            } elseif (preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']/', $html, $matches)) {
+                $imageUrl = $matches[1];
+            }
+            
+            // Also try to find high-res image URLs directly (fbcdn URLs)
+            if (!$imageUrl && preg_match('/https:\/\/scontent[^"\'<>\s]+\.jpg[^"\'<>\s]*/i', $html, $matches)) {
+                $imageUrl = html_entity_decode($matches[0]);
+            }
+            
+            if (!$imageUrl) {
+                Log::addWarning('Could not extract image URL from Facebook page: ' . $facebookUrl);
+                return false;
+            }
+            
+            // Decode HTML entities in the URL
+            $imageUrl = html_entity_decode($imageUrl);
+            Log::addInfo('Extracted Facebook image URL: ' . substr($imageUrl, 0, 150) . '...');
+            
+            // Download and import the image
+            return $this->processImageUrl($imageUrl);
+            
+        } catch (\Exception $e) {
+            Log::addWarning('Error processing Facebook photo URL: ' . $e->getMessage());
+            return false;
+        }
+    }
+    
+    /**
+     * Download and import an image from a URL
+     * @param string $imageUrl The direct image URL
+     * @return int|false File ID on success, false on failure
+     */
+    private function processImageUrl($imageUrl)
+    {
+        try {
+            $context = stream_context_create([
+                'http' => [
+                    'method' => 'GET',
+                    'header' => [
+                        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept: image/webp,image/apng,image/*,*/*;q=0.8'
+                    ],
+                    'timeout' => 30,
+                    'follow_location' => 1,
+                    'max_redirects' => 10
+                ]
+            ]);
+            
+            $imageData = @file_get_contents($imageUrl, false, $context);
+            
+            if ($imageData === false || empty($imageData)) {
+                Log::addWarning('Failed to download image from URL: ' . $imageUrl);
+                return false;
+            }
+            
+            Log::addInfo('Downloaded image, size: ' . strlen($imageData) . ' bytes');
+            
+            // Determine file extension from content
+            $extension = 'jpg'; // default
+            if (function_exists('getimagesizefromstring')) {
+                $imageInfo = @getimagesizefromstring($imageData);
+                if ($imageInfo) {
+                    $mimeToExt = [
+                        'image/jpeg' => 'jpg',
+                        'image/png' => 'png',
+                        'image/gif' => 'gif',
+                        'image/webp' => 'webp'
+                    ];
+                    if (isset($mimeToExt[$imageInfo['mime']])) {
+                        $extension = $mimeToExt[$imageInfo['mime']];
+                    }
+                }
+            }
+            
+            // Generate a unique filename
+            $filename = 'product_' . uniqid() . '.' . $extension;
+            
+            // Save to temporary file
+            $fileService = $this->app->make(FileService::class);
+            $tempPath = $fileService->getTemporaryDirectory() . '/' . $filename;
+            file_put_contents($tempPath, $imageData);
+            
+            // Import the file
+            $importer = new Importer();
+            $result = $importer->import($tempPath, $filename);
+            
+            // Clean up temp file
+            @unlink($tempPath);
+            
+            if ($result instanceof \Concrete\Core\File\Version\Version) {
+                $fileId = $result->getFile()->getFileID();
+                Log::addInfo('Successfully imported image from URL, file ID: ' . $fileId);
+                return $fileId;
+            } elseif (is_object($result) && method_exists($result, 'getFileID')) {
+                $fileId = $result->getFileID();
+                Log::addInfo('Successfully imported image from URL, file ID: ' . $fileId);
+                return $fileId;
+            }
+            
+            Log::addWarning('Failed to import image from URL: ' . $imageUrl);
+            return false;
+            
+        } catch (\Exception $e) {
+            Log::addWarning('Error downloading image from URL: ' . $e->getMessage());
+            return false;
+        }
     }
 
     /**
