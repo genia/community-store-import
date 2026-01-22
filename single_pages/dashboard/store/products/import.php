@@ -1,13 +1,11 @@
 <?php  defined('C5_EXECUTE') or die('Access denied'); ?>
 
 <?php
-use Concrete\Core\File\File;
 use Concrete\Core\Config\Repository\Repository as Config;
 use Concrete\Core\Support\Facade\Application;
 
 $app = Application::getFacadeApplication();
 $config = $app->make(Config::class);
-$importFID = File::getByID(intval($config->get('community_store_import.import_file')));
 ?>
 
 <form method="post" class="form-horizontal" id="import-form" action="<?php echo $view->action('run') ?>" >
@@ -24,14 +22,7 @@ $importFID = File::getByID(intval($config->get('community_store_import.import_fi
 
         <div class="form-group">
             <div class="col-md-6">
-                <label class="control-label"><?php echo t('Product Import File') ?></label>
-                <?php echo $concrete_asset_library->file('ccm-import-file', 'import_file', 'Choose File', $importFID) ?>
-                <div class="help-block"><?php echo t('Choose the CSV file to import, OR use Google Sheets URL below.') ?></div>
-            </div>
-        </div>
-        <div class="form-group">
-            <div class="col-md-6">
-                <label class="control-label"><?php echo t('Or Import from Google Sheets') ?></label>
+                <label class="control-label"><?php echo t('Google Sheets URL') ?></label>
                 <?php echo $form->text('google_sheets_url', '', ['placeholder' => 'https://docs.google.com/spreadsheets/d/...', 'class' => 'form-control']); ?>
                 <div class="help-block">
                     <?php echo t('Enter a public Google Sheets URL to import directly.') ?><br>
@@ -68,23 +59,6 @@ $importFID = File::getByID(intval($config->get('community_store_import.import_fi
                     <ul id="uploaded-files-list" style="list-style: none; padding: 0; margin-top: 15px; text-align: left;"></ul>
                 </div>
                 <div class="help-block"><?php echo t('Drop image files or folders here to upload them. All images from folders will be processed recursively. Files with the same filename will be skipped if they already exist in the system.') ?></div>
-            </div>
-        </div>
-        <div class="form-group">
-            <div class="col-md-2">
-                <label class="control-label"><?php echo t('Field Delimiter') ?></label>
-                <?php echo $form->text('delimiter', $config->get('community_store_import.csv.delimiter')) ?>
-                <div class="help-block"><?php echo t('Enter tab as \t.') ?></div>
-            </div>
-            <div class="col-md-2">
-                <label class="control-label"><?php echo t('Field Enclosure') ?></label>
-                <?php echo $form->text('enclosure', $config->get('community_store_import.csv.enclosure')) ?>
-                <div class="help-block"><?php echo t('') ?></div>
-            </div>
-            <div class="col-md-2">
-                <label class="control-label"><?php echo t('Line Length') ?></label>
-                <?php echo $form->text('line_length', $config->get('community_store_import.csv.line_length')) ?>
-                <div class="help-block"><?php echo t('') ?></div>
             </div>
         </div>
         <div class="form-group">

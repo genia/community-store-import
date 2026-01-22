@@ -132,90 +132,46 @@ class Import extends DashboardPageController
         @ini_set('auto_detect_line_endings', TRUE); // Suppress deprecation warning in PHP 8.1+
 
         $data = $this->post();
-        $handle = null;
-        $isGoogleSheets = false;
+        $isGoogleSheets = true; // Always using Google Sheets now
         $googleSheetsImageMap = []; // Map row index => image file path for embedded images
         $googleSheetsData = null; // Parsed data from Google Sheets HTML
         $headings = [];
         $allRows = []; // All data rows to process
 
-        // Check if Google Sheets URL is provided
-        if (!empty($data['google_sheets_url'])) {
-            // Extract spreadsheet ID
-            if (!preg_match('/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/', $data['google_sheets_url'], $matches)) {
-                $this->error->add(t("Invalid Google Sheets URL."));
-                return;
-            }
-            $spreadsheetId = $matches[1];
-            
-            // Download and parse the zip export (HTML + images)
-            Log::addInfo('Parsing Google Sheets zip export for spreadsheet ID: ' . $spreadsheetId);
-            $googleSheetsData = $this->parseGoogleSheetsZip($spreadsheetId);
-            
-            if ($googleSheetsData === false) {
-                // Check the log for specific failure reason
-                $this->error->add(t("Failed to fetch data from Google Sheets. Check the logs for details. Spreadsheet ID: %s", $spreadsheetId));
-                return;
-            }
-            
-            if (empty($googleSheetsData['headings'])) {
-                $this->error->add(t("No data found in Google Sheets. The sheet may be empty or the format is not recognized."));
-                return;
-            }
-            
-            $headings = $googleSheetsData['headings'];
-            $allRows = $googleSheetsData['rows'];
-            $googleSheetsImageMap = $googleSheetsData['images'];
-            $isGoogleSheets = true;
-            
-            Log::addInfo('Google Sheets parsed: ' . count($headings) . ' columns, ' . count($allRows) . ' rows, ' . count($googleSheetsImageMap) . ' images');
-        } else {
-            // Use uploaded CSV file
-        $f = File::getByID($config->get('community_store_import.import_file'));
-            if (!$f || $f->isError()) {
-                $this->error->add(t("Import file not found. Please upload a CSV file or provide a Google Sheets URL."));
-                return;
-            }
-        $fname = $_SERVER['DOCUMENT_ROOT'] . $f->getApprovedVersion()->getRelativePath();
-
-        if (!file_exists($fname) || !is_readable($fname)) {
-            $this->error->add(t("Import file not found or is not readable."));
+        // Google Sheets URL is required
+        if (empty($data['google_sheets_url'])) {
+            $this->error->add(t("Google Sheets URL is required."));
             return;
         }
-
-        if (!$handle = @fopen($fname, 'r')) {
-            $this->error->add(t('Cannot open file %s.', $fname));
+        
+        // Extract spreadsheet ID
+        if (!preg_match('/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/', $data['google_sheets_url'], $matches)) {
+            $this->error->add(t("Invalid Google Sheets URL."));
             return;
         }
-
-        $delim = $config->get('community_store_import.csv.delimiter');
-        $delim = ($delim === '\t') ? "\t" : $delim;
-            if (empty($delim)) {
-                $delim = ',';
-            }
-
-        $enclosure = $config->get('community_store_import.csv.enclosure');
-            if (empty($enclosure)) {
-                $enclosure = '"';
-            }
-            
-            $line_length = (int) $config->get('community_store_import.csv.line_length');
-            if ($line_length <= 0) {
-                $line_length = 0; // 0 means no limit in fgetcsv
-            }
-
-            // Get headings from first row
-        $csv = fgetcsv($handle, $line_length, $delim, $enclosure);
-        $headings = array_map('strtolower', $csv);
-            
-            // Read all data rows
-            while (($csv = fgetcsv($handle, $line_length, $delim, $enclosure)) !== FALSE) {
-                if (count($csv) > 1) {
-                    $allRows[] = $csv;
-                }
-            }
-            fclose($handle);
+        $spreadsheetId = $matches[1];
+        
+        // Download and parse the zip export (HTML + images)
+        Log::addInfo('Parsing Google Sheets zip export for spreadsheet ID: ' . $spreadsheetId);
+        $googleSheetsData = $this->parseGoogleSheetsZip($spreadsheetId);
+        
+        if ($googleSheetsData === false) {
+            // Check the log for specific failure reason
+            $this->error->add(t("Failed to fetch data from Google Sheets. Check the logs for details. Spreadsheet ID: %s", $spreadsheetId));
+            return;
         }
+        
+        if (empty($googleSheetsData['headings'])) {
+            $this->error->add(t("No data found in Google Sheets. The sheet may be empty or the format is not recognized."));
+            return;
+        }
+        
+        $headings = $googleSheetsData['headings'];
+        $allRows = $googleSheetsData['rows'];
+        $googleSheetsImageMap = $googleSheetsData['images'];
+        $isGoogleSheets = true;
+        
+        Log::addInfo('Google Sheets parsed: ' . count($headings) . ' columns, ' . count($allRows) . ' rows, ' . count($googleSheetsImageMap) . ' images');
 
         if ($this->isValid($headings)) {
             $this->error->add(t("Required data missing."));
@@ -1088,11 +1044,7 @@ class Import extends DashboardPageController
 
         // @TODO: Validate post data
 
-        $config->save('community_store_import.import_file', $data['import_file']);
         $config->save('community_store_import.max_execution_time', $data['max_execution_time']);
-        $config->save('community_store_import.csv.delimiter', $data['delimiter']);
-        $config->save('community_store_import.csv.enclosure', $data['enclosure']);
-        $config->save('community_store_import.csv.line_length', $data['line_length']);
     }
 
     /**
