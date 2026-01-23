@@ -633,6 +633,17 @@ class Import extends DashboardPageController
                 return false;
             }
             
+            // Calculate checksum to check for duplicates
+            $checksum = md5($imageData);
+            $fileSize = strlen($imageData);
+            
+            // Check if a file with this checksum already exists
+            $existingFile = $this->findExistingFileByChecksum($checksum, $fileSize);
+            if ($existingFile) {
+                Log::addInfo('Found existing image with matching checksum, reusing file ID: ' . $existingFile->getFileID());
+                return $existingFile->getFileID();
+            }
+            
             // Determine file extension from filename or content
             $extension = 'jpg'; // default
             if ($originalFilename && preg_match('/\.(jpg|jpeg|png|gif|webp)/i', $originalFilename, $matches)) {
@@ -663,7 +674,7 @@ class Import extends DashboardPageController
             $tempPath = $fileService->getTemporaryDirectory() . '/' . $filename;
             file_put_contents($tempPath, $imageData);
             
-            Log::addInfo('Saved temp image: ' . $tempPath . ' (' . strlen($imageData) . ' bytes)');
+            Log::addInfo('Saved temp image: ' . $tempPath . ' (' . strlen($imageData) . ' bytes, checksum: ' . $checksum . ')');
             
             // Import into ConcreteCMS
             $importer = $this->app->make(Importer::class);
@@ -674,6 +685,7 @@ class Import extends DashboardPageController
             
             if ($fv instanceof \Concrete\Core\Entity\File\Version) {
                 $file = $fv->getFile();
+                Log::addInfo('Uploaded new image, file ID: ' . $file->getFileID());
                 return $file->getFileID();
             }
         } catch (Exception $e) {
@@ -1404,6 +1416,53 @@ class Import extends DashboardPageController
         } catch (Exception $e) {
             // If there's an error, just continue and upload new file
             Log::addWarning('Error checking for existing file: ' . $filename . ' - ' . $e->getMessage());
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Find an existing file by checksum and file size
+     * This allows detecting duplicate images even if they have different filenames
+     * @param string $checksum MD5 checksum of the file content
+     * @param int $fileSize File size in bytes
+     * @return File|false File object if found, false otherwise
+     */
+    private function findExistingFileByChecksum($checksum, $fileSize)
+    {
+        try {
+            $db = \Database::connection();
+            
+            // First, try to find by file size and hash if fvHash column exists
+            // Query for files with matching file size
+            $query = "SELECT f.fID, fv.fvFilename FROM Files f 
+                      INNER JOIN FileVersions fv ON f.fID = fv.fID 
+                      WHERE fv.fvIsApproved = 1 
+                      AND fv.fvSize = ?
+                      ORDER BY fv.fvID DESC";
+            
+            $results = $db->fetchAll($query, [$fileSize]);
+            
+            // Check each file with matching size by calculating its checksum
+            foreach ($results as $row) {
+                $file = File::getByID($row['fID']);
+                if ($file && !$file->isError()) {
+                    $fileVersion = $file->getApprovedVersion();
+                    if ($fileVersion) {
+                        $filePath = $fileVersion->getFile();
+                        if (file_exists($filePath)) {
+                            $fileContent = @file_get_contents($filePath);
+                            if ($fileContent && md5($fileContent) === $checksum) {
+                                Log::addInfo('Found duplicate image by content checksum: ' . $fileVersion->getFilename() . ' (file ID: ' . $file->getFileID() . ')');
+                                return $file;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception $e) {
+            // If there's an error, just continue and upload new file
+            Log::addWarning('Error checking for existing file by checksum: ' . $e->getMessage());
         }
         
         return false;
